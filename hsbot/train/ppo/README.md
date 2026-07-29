@@ -126,13 +126,34 @@ V-Trace target) and off-policy queue balancing — both only matter once trainin
 distributed/off-policy; per-hero model isolation; auto-regressive action decomposition with
 shared card/hero embeddings; and a principled fictitious-play weighting (OSFP) over the league.
 
+## Scaling: vectorized parallel envs (`ppo_vec.py`)
+
+The single stdio env was the throughput bottleneck. `ppo_vec.py` runs **N env subprocesses in
+lockstep** (`VecEnv`): a batched command is written to all N stdins and flushed, so the N
+SabberStone processes step concurrently across cores while Python **batches policy inference**
+across them. Same agent (entity-transformer + LSTM + privileged critic + shaping); per-env
+trajectories are kept separate so shaping/GAE stay per-episode-correct. Simplification: the
+opponent is self-play or greedy (the frozen-snapshot league is dropped so all inference batches
+through one net).
+
+```
+python ppo_vec.py --num-envs 8 --iters 200 --steps 4096 --fixed-deck
+```
+
+Measured on an 8-core laptop: **~447 → ~1500-1700 steps/s (~3.5-4×)**. It's not the full 8×
+because the greedy opponent's clone-heavy steps dominate wall time and the Python loop adds
+serial overhead; on a many-core + GPU box the batched inference pays off more and the gap
+widens. **This is the infrastructure for a real strength run** — beating the greedy heuristic
+needs that run (millions of frames on real hardware over hours-to-days), which is compute, not
+code. Nothing here reaches that on a laptop in a short session.
+
 ## This is a prototype — upgrade paths
 
 - **League**: single-population self-play + **greedy heuristic as a training opponent** (both
   done) → AlphaStar-style **main / exploiter / main-exploiter** populations + prioritized/
   fictitious-play opponent sampling (OSFP).
-- **Throughput (now the main blocker to beating greedy)**: single stdio env → **many parallel
-  envs** (or SabberStone's gRPC extension) + GPU, for 10-100× the samples.
+- **Throughput (the main blocker to beating greedy)**: single stdio env → **many parallel
+  envs** (`ppo_vec.py`, done — see below) → then a real many-core/GPU box for the real run.
 - **Reward**: terminal ±1 only → add **board-score shaping** for denser signal.
 - **Imperfect info / RNG**: currently handled implicitly via the observable features; add
   **determinization / ISMCTS** for search-based strength (AlphaZero path "B").
