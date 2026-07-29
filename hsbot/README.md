@@ -25,7 +25,10 @@ hsbot/
     src/main/resources/META-INF/services/   # plugin + strategy registration
   train/               # Python — value net + ONNX export                     (TODO)
     reference_features.py         # independent ground-truth extractor + fixture generator
-  trainer/             # C#  — SabberStone self-play + feature/label dumper   (TODO)
+  trainer/             # C#  — SabberStone self-play + feature/label dumper (DONE: scaffold)
+    SabberStoneGen/               # console: ObservableState, FeatureExtractor,
+                                  #   SabberStoneObserver, SelfPlayGenerator, Program
+    SabberStoneGen.Tests/         # xUnit parity test vs fixtures
 ```
 
 ## Build (plugin)
@@ -44,9 +47,10 @@ to load, the strategy falls back to HS-Script's built-in heuristic so the bot st
 - [x] Feature contract v1 (`docs/FEATURES.md`), accessors verified in both engines
 - [x] Kotlin plugin skeleton (strategy + ONNX ScoreCalculator + feature extractor)
 - [x] Parity fixtures (`fixtures/*.json`, 3) + Python reference + Kotlin parity test
-- [ ] C# SabberStone self-play data/label generator (must match the Python reference)
+- [x] C# SabberStone self-play generator + extractor + xUnit parity test
 - [ ] Python training + ONNX export
 - [ ] Real deck code wired into `ValueNetStrategyDeck.deckCode()`
+- [ ] First real builds: `mvn -pl hs-plugin test` (Kotlin) and `dotnet test` (C#)
 
 ## Caveats
 
