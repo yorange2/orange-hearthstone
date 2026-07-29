@@ -19,40 +19,47 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from env import SabberEnv, OBS_DIM, ACT_DIM
+from env import SabberEnv, OBS_DIM, ACT_DIM, PRIV_DIM
 
 
 class ActorCritic(nn.Module):
-    def __init__(self, obs_dim=OBS_DIM, act_dim=ACT_DIM, hid=128):
+    """Asymmetric (privileged) actor-critic. The policy sees only the observable state; the
+    value head additionally sees `priv` (opponent-hidden features) — the "Cheat" technique
+    from Xiao et al. 2023. The critic is unused at inference, so there is no train/test gap.
+    """
+
+    def __init__(self, obs_dim=OBS_DIM, act_dim=ACT_DIM, priv_dim=PRIV_DIM, hid=128):
         super().__init__()
         self.state_enc = nn.Sequential(nn.Linear(obs_dim, hid), nn.ReLU(), nn.Linear(hid, hid), nn.ReLU())
-        self.value = nn.Linear(hid, 1)
         self.scorer = nn.Sequential(nn.Linear(hid + act_dim, hid), nn.ReLU(), nn.Linear(hid, 1))
+        self.value_enc = nn.Sequential(nn.Linear(obs_dim + priv_dim, hid), nn.ReLU(), nn.Linear(hid, hid), nn.ReLU())
+        self.value = nn.Linear(hid, 1)
 
-    def forward(self, obs, actions, mask):
-        """obs [B,obs_dim]; actions [B,N,act_dim]; mask [B,N] bool. -> logits [B,N], value [B]."""
-        s = self.state_enc(obs)                      # [B,hid]
-        v = self.value(s).squeeze(-1)                # [B]
-        b, n, _ = actions.shape
+    def forward(self, obs, priv, actions, mask):
+        """obs [B,obs]; priv [B,priv]; actions [B,N,act]; mask [B,N]. -> logits [B,N], value [B]."""
+        s = self.state_enc(obs)                      # [B,hid] (policy, observable only)
+        _, n, _ = actions.shape
         se = s.unsqueeze(1).expand(-1, n, -1)        # [B,N,hid]
         logits = self.scorer(torch.cat([se, actions], dim=-1)).squeeze(-1)  # [B,N]
         logits = logits.masked_fill(~mask, -1e9)
+        v = self.value(self.value_enc(torch.cat([obs, priv], dim=-1))).squeeze(-1)  # [B] (privileged)
         return logits, v
 
 
 @torch.no_grad()
-def act(policy, obs, actions):
+def act(policy, obs, priv, actions):
     """Single-state action selection during rollout. Returns (idx, logprob, value)."""
     o = torch.from_numpy(obs).unsqueeze(0)
+    p = torch.from_numpy(priv).unsqueeze(0)
     a = torch.from_numpy(actions).unsqueeze(0)
     m = torch.ones(1, actions.shape[0], dtype=torch.bool)
-    logits, v = policy(o, a, m)
+    logits, v = policy(o, p, a, m)
     dist = torch.distributions.Categorical(logits=logits[0])
     idx = dist.sample()
     return int(idx), float(dist.log_prob(idx)), float(v[0])
 
 
-def gae(rewards, values, dones, last_v, gamma=0.99, lam=0.95):
+def gae(rewards, values, dones, last_v, gamma=1.0, lam=0.95):
     adv = np.zeros(len(rewards), np.float32)
     gae_ = 0.0
     for t in reversed(range(len(rewards))):
@@ -81,28 +88,29 @@ def train(args):
     policy = ActorCritic()
     opt = torch.optim.Adam(policy.parameters(), lr=args.lr)
 
-    obs, actions = env.reset()
+    obs, priv, actions = env.reset()
     for it in range(1, args.iters + 1):
         # ---- collect a rollout ----
-        buf_obs, buf_act, buf_idx, buf_lp, buf_v, buf_r, buf_d = [], [], [], [], [], [], []
+        buf_obs, buf_priv, buf_act, buf_idx = [], [], [], []
+        buf_lp, buf_v, buf_r, buf_d = [], [], [], []
         ep_returns = []
         for _ in range(args.steps):
-            idx, lp, v = act(policy, obs, actions)
-            nobs, nactions, r, done = env.step(idx)
-            buf_obs.append(obs); buf_act.append(actions); buf_idx.append(idx)
+            idx, lp, v = act(policy, obs, priv, actions)
+            nobs, npriv, nactions, r, done = env.step(idx)
+            buf_obs.append(obs); buf_priv.append(priv); buf_act.append(actions); buf_idx.append(idx)
             buf_lp.append(lp); buf_v.append(v); buf_r.append(r); buf_d.append(float(done))
             if done:
                 ep_returns.append(r)
-                obs, actions = env.reset()
+                obs, priv, actions = env.reset()
             else:
-                obs, actions = nobs, nactions
+                obs, priv, actions = nobs, npriv, nactions
 
-        with torch.no_grad():
-            _, _, last_v = act(policy, obs, actions)
+        _, _, last_v = act(policy, obs, priv, actions)
         adv, ret = gae(buf_r, buf_v, buf_d, last_v, args.gamma, args.lam)
         adv = (adv - adv.mean()) / (adv.std() + 1e-8)
 
         obs_t = torch.from_numpy(np.asarray(buf_obs, np.float32))
+        priv_t = torch.from_numpy(np.asarray(buf_priv, np.float32))
         act_t, mask_t = pad(buf_act)
         idx_t = torch.tensor(buf_idx)
         oldlp_t = torch.tensor(buf_lp)
@@ -113,7 +121,7 @@ def train(args):
         n = len(buf_idx)
         for _ in range(args.epochs):
             for mb in torch.randperm(n).split(args.minibatch):
-                logits, v = policy(obs_t[mb], act_t[mb], mask_t[mb])
+                logits, v = policy(obs_t[mb], priv_t[mb], act_t[mb], mask_t[mb])
                 dist = torch.distributions.Categorical(logits=logits)
                 newlp = dist.log_prob(idx_t[mb])
                 ratio = torch.exp(newlp - oldlp_t[mb])
@@ -144,7 +152,7 @@ def main():
     ap.add_argument("--epochs", type=int, default=4)
     ap.add_argument("--minibatch", type=int, default=256)
     ap.add_argument("--lr", type=float, default=3e-4)
-    ap.add_argument("--gamma", type=float, default=0.99)
+    ap.add_argument("--gamma", type=float, default=1.0)  # Xiao et al.: terminal-only reward, short episodes
     ap.add_argument("--lam", type=float, default=0.95)
     ap.add_argument("--clip", type=float, default=0.2)
     ap.add_argument("--vf", type=float, default=0.5)

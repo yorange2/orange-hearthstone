@@ -22,6 +22,7 @@ public sealed class HearthstoneEnv
 {
     public const int ObsDim = FeatureExtractor.Length; // 144
     public const int ActDim = ActionEncoder.Dim;       // 20
+    public const int PrivDim = PrivilegedEncoder.Dim;  // 8 (critic-only, training)
 
     private static readonly CardClass[] Classes =
     {
@@ -41,6 +42,9 @@ public sealed class HearthstoneEnv
 
     /// <summary>Legal-action feature matrix for the current decision point: [numActions, ActDim].</summary>
     public float[][] LegalActionFeatures { get; private set; } = System.Array.Empty<float[]>();
+
+    /// <summary>Privileged (opponent-hidden) features for the critic only: [PrivDim].</summary>
+    public float[] Privileged { get; private set; } = new float[PrivDim];
 
     public float[] Reset()
     {
@@ -72,7 +76,10 @@ public sealed class HearthstoneEnv
         AdvanceToLearnerOrEnd();
 
         if (_game.State == State.COMPLETE || _decisions >= MaxDecisions)
+        {
+            Privileged = new float[PrivDim];
             return (new float[ObsDim], TerminalReward(), true);
+        }
 
         return (Observe(), 0f, false);
     }
@@ -96,6 +103,7 @@ public sealed class HearthstoneEnv
         for (int i = 0; i < _legal.Count; i++)
             feats[i] = ActionEncoder.Encode(_legal[i], me);
         LegalActionFeatures = feats;
+        Privileged = PrivilegedEncoder.Encode(_game.CurrentOpponent);
         return FeatureExtractor.Extract(_observer.Observe(_game));
     }
 

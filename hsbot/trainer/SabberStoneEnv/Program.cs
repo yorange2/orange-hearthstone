@@ -25,13 +25,13 @@ while ((line = Console.In.ReadLine()) != null)
     if (line == "reset")
     {
         float[] obs = env.Reset();
-        Write(obs, env.LegalActionFeatures, 0f, false);
+        Write(obs, env.Privileged, env.LegalActionFeatures, 0f, false);
     }
     else if (line.StartsWith("step"))
     {
         int idx = int.Parse(line.AsSpan(4).Trim());
         var (obs, reward, done) = env.Step(idx);
-        Write(obs, done ? System.Array.Empty<float[]>() : env.LegalActionFeatures, reward, done);
+        Write(obs, env.Privileged, done ? System.Array.Empty<float[]>() : env.LegalActionFeatures, reward, done);
     }
     else if (line == "close")
     {
@@ -39,9 +39,9 @@ while ((line = Console.In.ReadLine()) != null)
     }
 }
 
-void Write(float[] obs, float[][] actions, float reward, bool done)
+void Write(float[] obs, float[] priv, float[][] actions, float reward, bool done)
 {
-    var resp = new Response { Obs = obs, Actions = actions, Reward = reward, Done = done };
+    var resp = new Response { Obs = obs, Priv = priv, Actions = actions, Reward = reward, Done = done };
     stdout.WriteLine(JsonSerializer.Serialize(resp, jsonOpts));
     stdout.Flush();
 }
@@ -49,6 +49,7 @@ void Write(float[] obs, float[][] actions, float reward, bool done)
 sealed class Response
 {
     public float[] Obs { get; set; } = System.Array.Empty<float>();
+    public float[] Priv { get; set; } = System.Array.Empty<float>();
     public float[][] Actions { get; set; } = System.Array.Empty<float[]>();
     public float Reward { get; set; }
     public bool Done { get; set; }
