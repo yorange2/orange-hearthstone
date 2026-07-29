@@ -1,0 +1,22 @@
+# Upstream reference clones (SabberStone, Hearthstone-Script + submodules) — not ours to track
+vendor/
+
+# Build output
+target/
+**/target/
+*.class
+
+# Trained models / large artifacts
+*.onnx
+models/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# IDE / OS
+.idea/
+*.iml
+.DS_Store
