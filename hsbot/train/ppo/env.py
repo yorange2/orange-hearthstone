@@ -25,6 +25,7 @@ PRIV_DIM = 8  # opponent-hidden features, critic-only (training)
 class Obs:
     """One decision point, from the current mover's perspective."""
     tokens: np.ndarray   # [T, TOKEN_DIM]
+    flat: np.ndarray     # [144] flat observable features (FEATURES.md v1)
     priv: np.ndarray     # [PRIV_DIM]  (critic-only)
     actions: np.ndarray  # [N, ACT_DIM]
     player: int          # 1 or 2 — whose turn it is
@@ -55,7 +56,8 @@ class SabberEnv:
         return np.asarray(rows, dtype=np.float32) if rows else np.zeros((0, dim), np.float32)
 
     def _obs(self, d: dict) -> "Obs":
-        return Obs(self._mat(d["tokens"], TOKEN_DIM), np.asarray(d["priv"], np.float32),
+        return Obs(self._mat(d["tokens"], TOKEN_DIM), np.asarray(d["flat"], np.float32),
+                   np.asarray(d["priv"], np.float32),
                    self._mat(d["actions"], ACT_DIM), int(d["player"]), float(d["potential"]))
 
     # ---- low-level primitives (used by VecEnv to pipeline N processes) ----
