@@ -22,10 +22,13 @@ iter 25   [vs random 0.83 | vs greedy 0.05]
 outperform `基础策略`-style play? **No — not at this scale.** "Beats random" is a near-useless
 signal; a competent one-ply greedy heuristic is a much higher bar this prototype doesn't clear.
 
-Closing the gap is a *scale + curriculum* problem, not an architecture one: put the greedy
-agent (and stronger snapshots) into the training league so the policy actually trains against
-it, run many parallel envs for far more samples, use real decks, and lengthen training — see
-below. The value of this benchmark is that it replaces wishful "beats random" with the truth.
+**Training against the greedy agent (curriculum)** — the greedy heuristic is now a training
+opponent too (`--greedy-prob`, default 0.3), not just an eval. It helps: over 30 iters,
+vs-greedy rose from ~0.00-0.05 to **~0.15-0.20** (3-4×). But it still loses ~80-85% — 30 iters
+on a single CPU env (~23k samples) is far too little. So the mechanism/curriculum is right; the
+remaining wall is **throughput** (many parallel envs, more iterations, real decks). The value
+of this benchmark is that it replaced wishful "beats random" with the truth, and gives a real
+target to optimize.
 
 ## Pieces
 
@@ -116,10 +119,11 @@ shared card/hero embeddings; and a principled fictitious-play weighting (OSFP) o
 
 ## This is a prototype — upgrade paths
 
-- **League**: single-population self-play (done) → **train against the greedy heuristic**
-  (add it as a league opponent, not just an eval) and AlphaStar-style **main / exploiter /
-  main-exploiter** populations + prioritized/fictitious-play opponent sampling (OSFP). This is
-  the direct lever to actually beat the greedy benchmark above.
+- **League**: single-population self-play + **greedy heuristic as a training opponent** (both
+  done) → AlphaStar-style **main / exploiter / main-exploiter** populations + prioritized/
+  fictitious-play opponent sampling (OSFP).
+- **Throughput (now the main blocker to beating greedy)**: single stdio env → **many parallel
+  envs** (or SabberStone's gRPC extension) + GPU, for 10-100× the samples.
 - **Reward**: terminal ±1 only → add **board-score shaping** for denser signal.
 - **Imperfect info / RNG**: currently handled implicitly via the observable features; add
   **determinization / ISMCTS** for search-based strength (AlphaZero path "B").
