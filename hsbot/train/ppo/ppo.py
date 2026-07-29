@@ -133,7 +133,7 @@ def collect(env, main, sample_opp, steps):
     its own LSTM state, reset per game; each stored transition keeps the LSTM INPUT state (R2D2
     stored-state) so the update can recompute one step. Terminal +/-1 reward is attached to the
     episode's last main transition. Returns buffers + returns."""
-    tok, prv, act_, idx_, lp_, v_, r_, d_, hin_, cin_ = ([] for _ in range(10))
+    tok, prv, act_, idx_, lp_, v_, r_, d_, hin_, cin_, phi_ = ([] for _ in range(11))
     ep_returns = []
 
     def opp_state(o):
@@ -151,6 +151,7 @@ def collect(env, main, sample_opp, steps):
             tok.append(obs.tokens); prv.append(obs.priv); act_.append(obs.actions)
             idx_.append(i); lp_.append(lp); v_.append(v); r_.append(0.0); d_.append(0.0)
             hin_.append(mh.squeeze(0).numpy()); cin_.append(mc.squeeze(0).numpy())
+            phi_.append(obs.potential)
             last_main = len(idx_) - 1
             mh, mc = nh, nc
             obs, done, winner = env.step(i)
@@ -175,7 +176,7 @@ def collect(env, main, sample_opp, steps):
             oh, oc = opp_state(opp)
             last_main = None
 
-    return (tok, prv, act_, idx_, lp_, v_, r_, d_, hin_, cin_), ep_returns
+    return (tok, prv, act_, idx_, lp_, v_, r_, d_, hin_, cin_, phi_), ep_returns
 
 
 @torch.no_grad()
@@ -203,7 +204,7 @@ def evaluate(env, main, episodes, opponent="random"):
 
 
 def train(args):
-    env = SabberEnv(seed=args.seed, dll=args.dll, dotnet=args.dotnet)
+    env = SabberEnv(seed=args.seed, fixed_deck=args.fixed_deck, dll=args.dll, dotnet=args.dotnet)
     main = ActorCritic()
     opp_net = ActorCritic()  # reused shell, loaded with a league snapshot on demand
     opt = torch.optim.Adam(main.parameters(), lr=args.lr)
@@ -228,7 +229,14 @@ def train(args):
 
     snapshot()  # seed the league with the initial policy
     for it in range(1, args.iters + 1):
-        (tok, prv, act_, idx_, lp_, v_, r_, d_, hin_, cin_), ep_returns = collect(env, main, sample_opp, args.steps)
+        (tok, prv, act_, idx_, lp_, v_, r_, d_, hin_, cin_, phi_), ep_returns = collect(env, main, sample_opp, args.steps)
+
+        # Potential-based reward shaping F = coef*(gamma*Phi' - Phi): dense per-step signal from
+        # the board score, invariant of the optimal policy (Ng et al. 1999). Phi(terminal)=0.
+        if args.shaping_coef > 0:
+            for t in range(len(r_)):
+                next_phi = 0.0 if d_[t] else phi_[t + 1]
+                r_[t] += args.shaping_coef * (args.gamma * next_phi - phi_[t])
 
         adv, ret = gae(r_, v_, d_, 0.0, args.gamma, args.lam)  # episodes end within the rollout
         adv = (adv - adv.mean()) / (adv.std() + 1e-8)
@@ -290,6 +298,8 @@ def main():
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--gamma", type=float, default=1.0)  # Xiao et al.: terminal-only reward, short episodes
     ap.add_argument("--lam", type=float, default=0.95)
+    ap.add_argument("--shaping-coef", type=float, default=0.1, help="potential-based board-score shaping (0=off)")
+    ap.add_argument("--fixed-deck", action="store_true", help="Mage mirror + deterministic decks (low variance)")
     ap.add_argument("--clip", type=float, default=0.2)
     ap.add_argument("--vf", type=float, default=0.5)
     ap.add_argument("--ent", type=float, default=0.01)
