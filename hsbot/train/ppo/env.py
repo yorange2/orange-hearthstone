@@ -9,6 +9,7 @@ This is a deliberately simple bridge for the prototype; for many parallel actors
 subprocess for SabberStone's gRPC extension.
 """
 from __future__ import annotations
+import dataclasses
 import json
 import pathlib
 import subprocess
@@ -18,6 +19,15 @@ import numpy as np
 TOKEN_DIM = 18  # per entity token (v2 state representation)
 ACT_DIM = 20
 PRIV_DIM = 8  # opponent-hidden features, critic-only (training)
+
+
+@dataclasses.dataclass
+class Obs:
+    """One decision point, from the current mover's perspective."""
+    tokens: np.ndarray   # [T, TOKEN_DIM]
+    priv: np.ndarray     # [PRIV_DIM]  (critic-only)
+    actions: np.ndarray  # [N, ACT_DIM]
+    player: int          # 1 or 2 — whose turn it is
 
 _DEFAULT_DLL = (
     pathlib.Path(__file__).resolve().parents[2]
@@ -43,14 +53,17 @@ class SabberEnv:
     def _mat(rows, dim: int) -> np.ndarray:
         return np.asarray(rows, dtype=np.float32) if rows else np.zeros((0, dim), np.float32)
 
-    def reset(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        d = self._rpc("reset")
-        return self._mat(d["tokens"], TOKEN_DIM), np.asarray(d["priv"], np.float32), self._mat(d["actions"], ACT_DIM)
+    def _obs(self, d: dict) -> "Obs":
+        return Obs(self._mat(d["tokens"], TOKEN_DIM), np.asarray(d["priv"], np.float32),
+                   self._mat(d["actions"], ACT_DIM), int(d["player"]))
 
-    def step(self, idx: int) -> tuple[np.ndarray, np.ndarray, np.ndarray, float, bool]:
+    def reset(self) -> "Obs":
+        return self._obs(self._rpc("reset"))
+
+    def step(self, idx: int) -> tuple["Obs", bool, int]:
+        """Returns (next observation, done, winner[1/2/0])."""
         d = self._rpc(f"step {idx}")
-        return (self._mat(d["tokens"], TOKEN_DIM), np.asarray(d["priv"], np.float32),
-                self._mat(d["actions"], ACT_DIM), float(d["reward"]), bool(d["done"]))
+        return self._obs(d), bool(d["done"]), int(d["winner"])
 
     def close(self) -> None:
         try:

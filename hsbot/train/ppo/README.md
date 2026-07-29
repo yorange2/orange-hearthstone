@@ -1,38 +1,50 @@
 # ppo — reinforcement learning on SabberStone (prototype)
 
-A minimal, working **PPO** agent that learns Hearthstone by self-play against a random
-opponent inside SabberStone. Demonstrates the shape of RL path "A": a **masked
-action-scoring policy** over the variable legal-action set, driven through a simple
-stdio bridge to the C# engine.
+A working **PPO** agent that learns Hearthstone by **self-play with an opponent league** in
+SabberStone. RL path "A": a **masked action-scoring policy** over the variable legal-action
+set, over a transformer entity-encoder, driven through a simple stdio bridge to the C# engine.
 
 ## Result
 
-20 iterations (~20k steps, a couple of minutes on CPU) vs a random opponent:
+25 iterations of self-play (~2.5k games, a few minutes on CPU). Self-play win-rate hovers
+~0.6 (it plays near-equal past selves); the real signal is the periodic **eval vs a random
+opponent it never trains against**:
 
 ```
-iter  1  win_rate 0.35   ent 1.99
-iter  5  win_rate 0.75   ent 1.99
-iter 13  win_rate 0.86   ent 1.68
-iter 18  win_rate 0.95   ent 1.78
-iter 20  win_rate 0.85   ent 1.62
+iter  5  selfplay_wr 0.61  [eval vs random 0.53]
+iter 10  selfplay_wr 0.59  [eval vs random 0.77]
+iter 15  selfplay_wr 0.73  [eval vs random 0.77]
+iter 25  selfplay_wr 0.71  [eval vs random 0.80]
 ```
 
-Win-rate climbs from worse-than-random to ~0.85, entropy falls (policy sharpens), value
-loss drops — the loop learns.
+Pure self-play → generalizes to ~0.80 vs random. (Prototype scale; not a tuned result.)
 
 ## Pieces
 
-- **C# env** (`hsbot/trainer/SabberStoneEnv/`): `HearthstoneEnv` wraps SabberStone as a
-  single-agent MDP (agent = player 1; player 2 plays random inside the env). Encoders:
-  `TokenEncoder` (state = a **set** of entity tokens, 18 floats each — hero/minions/hand/
-  weapon/hero-power), `ActionEncoder` (each legal `PlayerTask` → 20 floats), `PrivilegedEncoder`
-  (opponent-hidden info, 8 floats, critic-only). `Program.cs` is a line-based stdio JSON
-  server: `reset` / `step <idx>` → `{tokens[T,18], priv[8], actions[N,20], reward, done}`.
+- **C# env** (`hsbot/trainer/SabberStoneEnv/`): `HearthstoneEnv` is a **seat-agnostic
+  two-player** env — it plays no opponent itself; every decision point is returned tagged with
+  `player` (whose turn), and Python routes it. Encoders: `TokenEncoder` (state = a **set** of
+  entity tokens, 18 floats each — hero/minions/hand/weapon/hero-power), `ActionEncoder` (each
+  legal `PlayerTask` → 20 floats), `PrivilegedEncoder` (opponent-hidden info, 8 floats,
+  critic-only). `Program.cs` stdio JSON server: `reset` / `step <idx>` →
+  `{tokens[T,18], priv[8], actions[N,20], player, done, winner}`.
 - **`env.py`**: subprocess wrapper around that server.
+- **`env.py`**: subprocess wrapper (`Obs` = tokens/priv/actions/player).
 - **`ppo.py`**: `EntityEncoder` (a small **transformer** over the entity-token set,
   permutation-invariant, masked mean-pool → state embedding) feeding `ActorCritic` (action
-  scorer over `concat(state_emb, action_feat)` + privileged value head), rollout, GAE,
-  clipped PPO, entropy bonus.
+  scorer over `concat(state_emb, action_feat)` + privileged value head); **self-play league**
+  (`collect` drives both seats — main policy stored, sampled opponent not; `snapshot`/
+  `sample_opp` manage the pool of past policies); GAE, clipped PPO, entropy bonus; `evaluate`
+  benchmarks vs random.
+
+### Self-play league
+
+Each game: the main policy takes a random seat; the opponent is the current policy (prob
+`--self-play-prob`) or a uniformly-sampled past **snapshot** from the league. Only the main
+seat's transitions train; the terminal ±1 reward is attached to that seat's last decision. The
+policy is snapshotted into the league every `--league-every` iters (capped at `--league-size`).
+This is the single-population core of league training — extend toward AlphaStar-style
+main/exploiter/main-exploiter populations for robustness.
 
 ### Why a transformer entity-encoder (the "state = time series / sequence" idea)
 
@@ -87,11 +99,12 @@ reports per-technique win-rate gains at scale.
 **Mapped but not yet done** (bigger lifts): improved V-Trace (ρ̄>1 + ρ floor + PPO-clip on a
 V-Trace target) and off-policy queue balancing — both only matter once training is
 distributed/off-policy; per-hero model isolation; auto-regressive action decomposition with
-shared card/hero embeddings; and OSFP self-play (vs the current random opponent).
+shared card/hero embeddings; and a principled fictitious-play weighting (OSFP) over the league.
 
 ## This is a prototype — upgrade paths
 
-- **Opponent**: random → self-play with an **opponent pool / league** (avoids cycling).
+- **League**: single-population self-play (done) → AlphaStar-style **main / exploiter /
+  main-exploiter** populations + prioritized/fictitious-play opponent sampling (OSFP).
 - **Reward**: terminal ±1 only → add **board-score shaping** for denser signal.
 - **Imperfect info / RNG**: currently handled implicitly via the observable features; add
   **determinization / ISMCTS** for search-based strength (AlphaZero path "B").
