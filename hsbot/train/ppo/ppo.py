@@ -48,37 +48,59 @@ class EntityEncoder(nn.Module):
         return (x * m).sum(1) / m.sum(1).clamp_min(1.0)       # masked mean pool
 
 
+H_DIM = 64  # LSTM belief-state size
+
+
 class ActorCritic(nn.Module):
+    """Entity-transformer -> LSTM belief state -> action scorer + privileged value.
+
+    Hearthstone is a POMDP (hidden opponent hand/deck), so a single board snapshot is not a
+    sufficient statistic. The LSTM carries a recurrent state across the agent's decisions
+    within a game, summarising the history into a belief the heads condition on — the standard
+    recurrent core in AlphaStar / OpenAI Five / Xiao et al. (LSTM, not a transformer-over-time,
+    for a cheap per-step recurrent state in online RL).
+
+    Recurrence uses the R2D2 stored-state scheme: each transition keeps the LSTM input state,
+    so the PPO update recomputes one step from it and minibatches stay per-transition (no BPTT
+    through time). `forward` returns the next state too, for stepping during rollout.
+    """
+
     def __init__(self, act_dim=ACT_DIM, priv_dim=PRIV_DIM, hid=128):
         super().__init__()
         self.enc = EntityEncoder()
         d = self.enc.out_dim
-        self.scorer = nn.Sequential(nn.Linear(d + act_dim, hid), nn.ReLU(), nn.Linear(hid, 1))
-        self.value_enc = nn.Sequential(nn.Linear(d + priv_dim, hid), nn.ReLU(), nn.Linear(hid, hid), nn.ReLU())
+        self.lstm = nn.LSTMCell(d, H_DIM)
+        self.scorer = nn.Sequential(nn.Linear(H_DIM + act_dim, hid), nn.ReLU(), nn.Linear(hid, 1))
+        self.value_enc = nn.Sequential(nn.Linear(H_DIM + priv_dim, hid), nn.ReLU(), nn.Linear(hid, hid), nn.ReLU())
         self.value = nn.Linear(hid, 1)
 
-    def forward(self, tokens, tmask, priv, actions, amask):
-        s = self.enc(tokens, tmask)                          # [B,d] (policy trunk, observable)
+    def initial_state(self, batch=1):
+        z = torch.zeros(batch, H_DIM)
+        return z, z.clone()
+
+    def forward(self, tokens, tmask, hin, cin, priv, actions, amask):
+        e = self.enc(tokens, tmask)                          # [B,d] per-state embedding
+        h, c = self.lstm(e, (hin, cin))                      # [B,H] belief state
         _, n, _ = actions.shape
-        se = s.unsqueeze(1).expand(-1, n, -1)                # [B,N,d]
+        se = h.unsqueeze(1).expand(-1, n, -1)                # [B,N,H]
         logits = self.scorer(torch.cat([se, actions], dim=-1)).squeeze(-1)  # [B,N]
         logits = logits.masked_fill(~amask, -1e9)
-        v = self.value(self.value_enc(torch.cat([s, priv], dim=-1))).squeeze(-1)  # [B] (privileged)
-        return logits, v
+        v = self.value(self.value_enc(torch.cat([h, priv], dim=-1))).squeeze(-1)  # [B] (privileged)
+        return logits, v, h, c
 
 
 @torch.no_grad()
-def act(policy, tokens, priv, actions):
-    """Single-state action selection during rollout. Returns (idx, logprob, value)."""
-    tk = torch.from_numpy(tokens).unsqueeze(0)
-    tm = torch.ones(1, tokens.shape[0], dtype=torch.bool)
-    p = torch.from_numpy(priv).unsqueeze(0)
-    a = torch.from_numpy(actions).unsqueeze(0)
-    am = torch.ones(1, actions.shape[0], dtype=torch.bool)
-    logits, v = policy(tk, tm, p, a, am)
+def act(policy, obs, hin, cin):
+    """One recurrent step. Returns (idx, logprob, value, h_out, c_out)."""
+    tk = torch.from_numpy(obs.tokens).unsqueeze(0)
+    tm = torch.ones(1, obs.tokens.shape[0], dtype=torch.bool)
+    p = torch.from_numpy(obs.priv).unsqueeze(0)
+    a = torch.from_numpy(obs.actions).unsqueeze(0)
+    am = torch.ones(1, obs.actions.shape[0], dtype=torch.bool)
+    logits, v, h, c = policy(tk, tm, hin, cin, p, a, am)
     dist = torch.distributions.Categorical(logits=logits[0])
     idx = dist.sample()
-    return int(idx), float(dist.log_prob(idx)), float(v[0])
+    return int(idx), float(dist.log_prob(idx)), float(v[0]), h, c
 
 
 def gae(rewards, values, dones, last_v, gamma=1.0, lam=0.95):
@@ -106,24 +128,30 @@ def pad(seqs, dim):
 
 
 def collect(env, main, sample_opp, steps):
-    """Self-play rollout. Runs whole episodes (main seat randomized, opponent sampled per game)
-    until >= `steps` MAIN transitions are gathered. Only the main seat is stored; the terminal
-    +/-1 reward is attached to that episode's last main transition. Returns buffers + returns."""
-    tok, prv, act_, idx_, lp_, v_, r_, d_ = [], [], [], [], [], [], [], []
+    """Self-play rollout with recurrent state. Runs whole episodes (main seat randomized,
+    opponent sampled per game) until >= `steps` MAIN transitions are gathered. Each seat carries
+    its own LSTM state, reset per game; each stored transition keeps the LSTM INPUT state (R2D2
+    stored-state) so the update can recompute one step. Terminal +/-1 reward is attached to the
+    episode's last main transition. Returns buffers + returns."""
+    tok, prv, act_, idx_, lp_, v_, r_, d_, hin_, cin_ = ([] for _ in range(10))
     ep_returns = []
 
     obs = env.reset()
     main_seat = random.choice((1, 2))
     opp = sample_opp()
+    mh, mc = main.initial_state()      # main seat LSTM state
+    oh, oc = opp.initial_state()       # opponent seat LSTM state
     last_main = None
     while True:
         if obs.player == main_seat:
-            i, lp, v = act(main, obs.tokens, obs.priv, obs.actions)
+            i, lp, v, nh, nc = act(main, obs, mh, mc)
             tok.append(obs.tokens); prv.append(obs.priv); act_.append(obs.actions)
             idx_.append(i); lp_.append(lp); v_.append(v); r_.append(0.0); d_.append(0.0)
+            hin_.append(mh.squeeze(0).numpy()); cin_.append(mc.squeeze(0).numpy())
             last_main = len(idx_) - 1
+            mh, mc = nh, nc
         else:
-            i, _, _ = act(opp, obs.tokens, obs.priv, obs.actions)
+            i, _, _, oh, oc = act(opp, obs, oh, oc)
 
         obs, done, winner = env.step(i)
         if done:
@@ -137,21 +165,24 @@ def collect(env, main, sample_opp, steps):
             obs = env.reset()
             main_seat = random.choice((1, 2))
             opp = sample_opp()
+            mh, mc = main.initial_state()
+            oh, oc = opp.initial_state()
             last_main = None
 
-    return (tok, prv, act_, idx_, lp_, v_, r_, d_), ep_returns
+    return (tok, prv, act_, idx_, lp_, v_, r_, d_, hin_, cin_), ep_returns
 
 
 @torch.no_grad()
 def evaluate(env, main, episodes):
-    """Absolute benchmark: main policy vs a uniform-random opponent. Returns win rate."""
+    """Absolute benchmark: main policy (recurrent) vs a uniform-random opponent. Win rate."""
     wins = 0
     for _ in range(episodes):
         obs = env.reset()
         seat = random.choice((1, 2))
+        mh, mc = main.initial_state()
         while True:
             if obs.player == seat:
-                i, _, _ = act(main, obs.tokens, obs.priv, obs.actions)
+                i, _, _, mh, mc = act(main, obs, mh, mc)
             else:
                 i = int(np.random.randint(obs.actions.shape[0]))
             obs, done, winner = env.step(i)
@@ -184,7 +215,7 @@ def train(args):
 
     snapshot()  # seed the league with the initial policy
     for it in range(1, args.iters + 1):
-        (tok, prv, act_, idx_, lp_, v_, r_, d_), ep_returns = collect(env, main, sample_opp, args.steps)
+        (tok, prv, act_, idx_, lp_, v_, r_, d_, hin_, cin_), ep_returns = collect(env, main, sample_opp, args.steps)
 
         adv, ret = gae(r_, v_, d_, 0.0, args.gamma, args.lam)  # episodes end within the rollout
         adv = (adv - adv.mean()) / (adv.std() + 1e-8)
@@ -192,16 +223,19 @@ def train(args):
         tok_t, tmask_t = pad(tok, TOKEN_DIM)
         act_t, amask_t = pad(act_, ACT_DIM)
         priv_t = torch.from_numpy(np.asarray(prv, np.float32))
+        hin_t = torch.from_numpy(np.asarray(hin_, np.float32))  # stored LSTM input state
+        cin_t = torch.from_numpy(np.asarray(cin_, np.float32))
         idx_t = torch.tensor(idx_)
         oldlp_t = torch.tensor(lp_)
         adv_t = torch.from_numpy(adv)
         ret_t = torch.from_numpy(ret)
 
-        # ---- PPO update ----
+        # ---- PPO update (recompute one LSTM step from the stored input state) ----
         n = len(idx_)
         for _ in range(args.epochs):
             for mb in torch.randperm(n).split(args.minibatch):
-                logits, v = main(tok_t[mb], tmask_t[mb], priv_t[mb], act_t[mb], amask_t[mb])
+                logits, v, _, _ = main(tok_t[mb], tmask_t[mb], hin_t[mb], cin_t[mb],
+                                       priv_t[mb], act_t[mb], amask_t[mb])
                 dist = torch.distributions.Categorical(logits=logits)
                 newlp = dist.log_prob(idx_t[mb])
                 ratio = torch.exp(newlp - oldlp_t[mb])
