@@ -50,7 +50,7 @@ void Write(HearthstoneEnv e, bool done)
 {
     var resp = new Response
     {
-        Tokens = e.Tokens, Priv = e.Privileged, Actions = e.LegalActionFeatures,
+        Tokens = e.Tokens, Flat = e.Flat, Priv = e.Privileged, Actions = e.LegalActionFeatures,
         Player = e.CurrentPlayerId, Potential = e.Potential, Done = done, Winner = e.Winner,
     };
     stdout.WriteLine(JsonSerializer.Serialize(resp, jsonOpts));
@@ -60,6 +60,7 @@ void Write(HearthstoneEnv e, bool done)
 sealed class Response
 {
     public float[][] Tokens { get; set; } = System.Array.Empty<float[]>();
+    public float[] Flat { get; set; } = System.Array.Empty<float>();
     public float[] Priv { get; set; } = System.Array.Empty<float>();
     public float[][] Actions { get; set; } = System.Array.Empty<float[]>();
     public int Player { get; set; }

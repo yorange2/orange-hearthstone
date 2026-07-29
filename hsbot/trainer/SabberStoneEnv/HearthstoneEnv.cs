@@ -36,6 +36,7 @@ public sealed class HearthstoneEnv
 
     // MidRangeScore reused as the shaping potential Φ (same heuristic the greedy opponent uses).
     private readonly SabberStoneBasicAI.Score.Score _potentialScorer = new SabberStoneBasicAI.Score.MidRangeScore();
+    private readonly SabberStoneGen.SabberStoneObserver _observer = new SabberStoneGen.SabberStoneObserver();
 
     private Game _game = null!;
     private List<SabberStoneCore.Tasks.PlayerTasks.PlayerTask> _legal = new();
@@ -64,6 +65,9 @@ public sealed class HearthstoneEnv
 
     /// <summary>Normalized board-score potential Φ ∈ [-1,1] for the current mover (reward shaping).</summary>
     public float Potential { get; private set; }
+
+    /// <summary>Flat 144-float observable features for the current mover (FEATURES.md v1, for value-net training data).</summary>
+    public float[] Flat { get; private set; } = new float[SabberStoneGen.FeatureExtractor.Length];
 
     public void Reset()
     {
@@ -126,6 +130,7 @@ public sealed class HearthstoneEnv
         LegalActionFeatures = feats;
         Privileged = PrivilegedEncoder.Encode(_game.CurrentOpponent);
         Tokens = TokenEncoder.Encode(_game);
+        Flat = SabberStoneGen.FeatureExtractor.Extract(_observer.Observe(_game));
         _potentialScorer.Controller = me;
         Potential = (float)System.Math.Tanh(_potentialScorer.Rate() / PotentialScale);
     }
