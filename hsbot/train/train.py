@@ -22,6 +22,16 @@ from model import ValueNet, FEATURE_DIM
 DEFAULT_OUT = os.path.expanduser("~/.hs-script/models/value_net.v1.onnx")
 
 
+def resolve_device(choice: str) -> str:
+    if choice != "auto":
+        return choice
+    if torch.cuda.is_available():
+        return "cuda"
+    if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
 def load_jsonl(path: pathlib.Path) -> tuple[np.ndarray, np.ndarray]:
     xs, ys = [], []
     with path.open() as fh:
@@ -59,7 +69,12 @@ def main() -> None:
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--val-split", type=float, default=0.1)
     ap.add_argument("--smoke", type=int, default=0, help="train on N synthetic rows instead of --data")
+    ap.add_argument("--device", choices=["auto", "cpu", "cuda", "mps"], default="auto",
+                    help="compute device; 'auto' picks cuda > mps > cpu")
     args = ap.parse_args()
+
+    device = resolve_device(args.device)
+    print(f"device: {device}")
 
     if args.smoke > 0:
         x, y = make_smoke(args.smoke)
@@ -75,10 +90,10 @@ def main() -> None:
     perm = np.random.default_rng(0).permutation(len(x))
     vi, ti = perm[:n_val], perm[n_val:]
     xt, yt = torch.from_numpy(x[ti]), torch.from_numpy(y[ti])
-    xv, yv = torch.from_numpy(x[vi]), torch.from_numpy(y[vi])
+    xv, yv = torch.from_numpy(x[vi]).to(device), torch.from_numpy(y[vi]).to(device)
 
     loader = DataLoader(TensorDataset(xt, yt), batch_size=args.batch, shuffle=True)
-    model = ValueNet()
+    model = ValueNet().to(device)
     opt = torch.optim.Adam(model.parameters(), lr=args.lr)
     loss_fn = torch.nn.BCEWithLogitsLoss()
 
@@ -87,6 +102,7 @@ def main() -> None:
     for epoch in range(1, args.epochs + 1):
         model.train()
         for xb, yb in loader:
+            xb, yb = xb.to(device), yb.to(device)
             opt.zero_grad()
             loss = loss_fn(model.logits(xb), yb)
             loss.backward()
@@ -111,7 +127,7 @@ def main() -> None:
 
 
 def export_onnx(model: ValueNet, out_path: str) -> None:
-    model.eval()
+    model.to("cpu").eval()  # export + verify on CPU for portability
     out = pathlib.Path(os.path.expanduser(out_path))
     out.parent.mkdir(parents=True, exist_ok=True)
     dummy = torch.zeros(1, FEATURE_DIM, dtype=torch.float32)
