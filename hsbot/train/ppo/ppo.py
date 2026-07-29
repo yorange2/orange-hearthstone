@@ -1,14 +1,16 @@
-"""Minimal PPO for Hearthstone with a masked action-scoring policy over SabberStone.
+"""PPO for Hearthstone with a transformer entity-encoder policy over SabberStone.
 
-The policy embeds the 144-float state, then scores each legal action's 20-float vector by
-MLP(concat(state_emb, action_feat)) and softmaxes over the *variable* legal set — so illegal
-actions are never scored (masking is implicit). A value head estimates the state value.
+State = a variable-size SET of entity tokens (hero/minions/hand/weapon/hero-power, 18 floats
+each). A small transformer attends over the set (permutation-invariant, any board size) — the
+relational board reasoning a flat feature vector can't do (cf. AlphaStar's entity encoder).
+The pooled state embedding feeds:
+  - an action-scoring policy head: score(concat(state_emb, action_feat[20])), softmax over the
+    variable legal set (masking implicit);
+  - a privileged value head that also sees opponent-hidden `priv[8]` (Xiao et al. "Cheat";
+    critic unused at inference -> no train/test gap).
 
-Single env vs a random opponent (see HearthstoneEnv). Reward is terminal ±1, so episodic
-return == win(+1)/loss(-1); "win rate" below is (return > 0). This is a prototype to show the
-shape: correct PPO mechanics (GAE, clipped objective, value loss, entropy), variable actions,
-and the SabberStone bridge. Upgrades: self-play/opponent pool, reward shaping, parallel envs,
-ONNX export of the policy for the HS-Script plugin.
+Trains vs a random opponent inside the env; reward is terminal +/-1; gamma=1.0. Prototype to
+show the shape — upgrades in README (self-play league, parallel envs, ONNX export, ...).
 
     python ppo.py --iters 50 --steps 2048
 """
@@ -19,41 +21,56 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from env import SabberEnv, OBS_DIM, ACT_DIM, PRIV_DIM
+from env import SabberEnv, TOKEN_DIM, ACT_DIM, PRIV_DIM
+
+
+class EntityEncoder(nn.Module):
+    """Transformer over the entity-token set -> a single state embedding (masked mean-pool).
+    No positional encoding: entities are a set, so the encoder is permutation-invariant."""
+
+    def __init__(self, token_dim=TOKEN_DIM, d=64, nhead=4, layers=2, ff=128):
+        super().__init__()
+        self.embed = nn.Linear(token_dim, d)
+        layer = nn.TransformerEncoderLayer(d, nhead, dim_feedforward=ff, batch_first=True)
+        self.tr = nn.TransformerEncoder(layer, num_layers=layers)
+        self.out_dim = d
+
+    def forward(self, tokens, tmask):
+        """tokens [B,T,token_dim]; tmask [B,T] bool (True = real). -> [B,d]."""
+        x = self.embed(tokens)
+        x = self.tr(x, src_key_padding_mask=~tmask)          # ignore padded tokens
+        m = tmask.float().unsqueeze(-1)                       # [B,T,1]
+        return (x * m).sum(1) / m.sum(1).clamp_min(1.0)       # masked mean pool
 
 
 class ActorCritic(nn.Module):
-    """Asymmetric (privileged) actor-critic. The policy sees only the observable state; the
-    value head additionally sees `priv` (opponent-hidden features) — the "Cheat" technique
-    from Xiao et al. 2023. The critic is unused at inference, so there is no train/test gap.
-    """
-
-    def __init__(self, obs_dim=OBS_DIM, act_dim=ACT_DIM, priv_dim=PRIV_DIM, hid=128):
+    def __init__(self, act_dim=ACT_DIM, priv_dim=PRIV_DIM, hid=128):
         super().__init__()
-        self.state_enc = nn.Sequential(nn.Linear(obs_dim, hid), nn.ReLU(), nn.Linear(hid, hid), nn.ReLU())
-        self.scorer = nn.Sequential(nn.Linear(hid + act_dim, hid), nn.ReLU(), nn.Linear(hid, 1))
-        self.value_enc = nn.Sequential(nn.Linear(obs_dim + priv_dim, hid), nn.ReLU(), nn.Linear(hid, hid), nn.ReLU())
+        self.enc = EntityEncoder()
+        d = self.enc.out_dim
+        self.scorer = nn.Sequential(nn.Linear(d + act_dim, hid), nn.ReLU(), nn.Linear(hid, 1))
+        self.value_enc = nn.Sequential(nn.Linear(d + priv_dim, hid), nn.ReLU(), nn.Linear(hid, hid), nn.ReLU())
         self.value = nn.Linear(hid, 1)
 
-    def forward(self, obs, priv, actions, mask):
-        """obs [B,obs]; priv [B,priv]; actions [B,N,act]; mask [B,N]. -> logits [B,N], value [B]."""
-        s = self.state_enc(obs)                      # [B,hid] (policy, observable only)
+    def forward(self, tokens, tmask, priv, actions, amask):
+        s = self.enc(tokens, tmask)                          # [B,d] (policy trunk, observable)
         _, n, _ = actions.shape
-        se = s.unsqueeze(1).expand(-1, n, -1)        # [B,N,hid]
+        se = s.unsqueeze(1).expand(-1, n, -1)                # [B,N,d]
         logits = self.scorer(torch.cat([se, actions], dim=-1)).squeeze(-1)  # [B,N]
-        logits = logits.masked_fill(~mask, -1e9)
-        v = self.value(self.value_enc(torch.cat([obs, priv], dim=-1))).squeeze(-1)  # [B] (privileged)
+        logits = logits.masked_fill(~amask, -1e9)
+        v = self.value(self.value_enc(torch.cat([s, priv], dim=-1))).squeeze(-1)  # [B] (privileged)
         return logits, v
 
 
 @torch.no_grad()
-def act(policy, obs, priv, actions):
+def act(policy, tokens, priv, actions):
     """Single-state action selection during rollout. Returns (idx, logprob, value)."""
-    o = torch.from_numpy(obs).unsqueeze(0)
+    tk = torch.from_numpy(tokens).unsqueeze(0)
+    tm = torch.ones(1, tokens.shape[0], dtype=torch.bool)
     p = torch.from_numpy(priv).unsqueeze(0)
     a = torch.from_numpy(actions).unsqueeze(0)
-    m = torch.ones(1, actions.shape[0], dtype=torch.bool)
-    logits, v = policy(o, p, a, m)
+    am = torch.ones(1, actions.shape[0], dtype=torch.bool)
+    logits, v = policy(tk, tm, p, a, am)
     dist = torch.distributions.Categorical(logits=logits[0])
     idx = dist.sample()
     return int(idx), float(dist.log_prob(idx)), float(v[0])
@@ -71,15 +88,15 @@ def gae(rewards, values, dones, last_v, gamma=1.0, lam=0.95):
     return adv, adv + np.asarray(values, np.float32)
 
 
-def pad(action_list):
-    """Ragged list of [n_i, act_dim] -> padded [B, maxN, act_dim] + bool mask [B, maxN]."""
-    b = len(action_list)
-    maxn = max(a.shape[0] for a in action_list)
-    out = np.zeros((b, maxn, ACT_DIM), np.float32)
+def pad(seqs, dim):
+    """Ragged list of [n_i, dim] -> padded [B, maxN, dim] + bool mask [B, maxN]."""
+    b = len(seqs)
+    maxn = max(s.shape[0] for s in seqs)
+    out = np.zeros((b, maxn, dim), np.float32)
     mask = np.zeros((b, maxn), bool)
-    for i, a in enumerate(action_list):
-        out[i, : a.shape[0]] = a
-        mask[i, : a.shape[0]] = True
+    for i, s in enumerate(seqs):
+        out[i, : s.shape[0]] = s
+        mask[i, : s.shape[0]] = True
     return torch.from_numpy(out), torch.from_numpy(mask)
 
 
@@ -88,30 +105,30 @@ def train(args):
     policy = ActorCritic()
     opt = torch.optim.Adam(policy.parameters(), lr=args.lr)
 
-    obs, priv, actions = env.reset()
+    tokens, priv, actions = env.reset()
     for it in range(1, args.iters + 1):
         # ---- collect a rollout ----
-        buf_obs, buf_priv, buf_act, buf_idx = [], [], [], []
+        buf_tok, buf_priv, buf_act, buf_idx = [], [], [], []
         buf_lp, buf_v, buf_r, buf_d = [], [], [], []
         ep_returns = []
         for _ in range(args.steps):
-            idx, lp, v = act(policy, obs, priv, actions)
-            nobs, npriv, nactions, r, done = env.step(idx)
-            buf_obs.append(obs); buf_priv.append(priv); buf_act.append(actions); buf_idx.append(idx)
+            idx, lp, v = act(policy, tokens, priv, actions)
+            ntok, npriv, nactions, r, done = env.step(idx)
+            buf_tok.append(tokens); buf_priv.append(priv); buf_act.append(actions); buf_idx.append(idx)
             buf_lp.append(lp); buf_v.append(v); buf_r.append(r); buf_d.append(float(done))
             if done:
                 ep_returns.append(r)
-                obs, priv, actions = env.reset()
+                tokens, priv, actions = env.reset()
             else:
-                obs, priv, actions = nobs, npriv, nactions
+                tokens, priv, actions = ntok, npriv, nactions
 
-        _, _, last_v = act(policy, obs, priv, actions)
+        _, _, last_v = act(policy, tokens, priv, actions)
         adv, ret = gae(buf_r, buf_v, buf_d, last_v, args.gamma, args.lam)
         adv = (adv - adv.mean()) / (adv.std() + 1e-8)
 
-        obs_t = torch.from_numpy(np.asarray(buf_obs, np.float32))
+        tok_t, tmask_t = pad(buf_tok, TOKEN_DIM)
+        act_t, amask_t = pad(buf_act, ACT_DIM)
         priv_t = torch.from_numpy(np.asarray(buf_priv, np.float32))
-        act_t, mask_t = pad(buf_act)
         idx_t = torch.tensor(buf_idx)
         oldlp_t = torch.tensor(buf_lp)
         adv_t = torch.from_numpy(adv)
@@ -121,7 +138,7 @@ def train(args):
         n = len(buf_idx)
         for _ in range(args.epochs):
             for mb in torch.randperm(n).split(args.minibatch):
-                logits, v = policy(obs_t[mb], priv_t[mb], act_t[mb], mask_t[mb])
+                logits, v = policy(tok_t[mb], tmask_t[mb], priv_t[mb], act_t[mb], amask_t[mb])
                 dist = torch.distributions.Categorical(logits=logits)
                 newlp = dist.log_prob(idx_t[mb])
                 ratio = torch.exp(newlp - oldlp_t[mb])

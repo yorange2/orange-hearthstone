@@ -23,16 +23,33 @@ loss drops — the loop learns.
 ## Pieces
 
 - **C# env** (`hsbot/trainer/SabberStoneEnv/`): `HearthstoneEnv` wraps SabberStone as a
-  single-agent MDP (agent = player 1; player 2 plays random inside the env). `ActionEncoder`
-  turns each legal `PlayerTask` into a 20-float vector. `Program.cs` is a line-based stdio
-  JSON server: `reset` / `step <idx>` → `{obs[144], actions[N,20], reward, done}`.
+  single-agent MDP (agent = player 1; player 2 plays random inside the env). Encoders:
+  `TokenEncoder` (state = a **set** of entity tokens, 18 floats each — hero/minions/hand/
+  weapon/hero-power), `ActionEncoder` (each legal `PlayerTask` → 20 floats), `PrivilegedEncoder`
+  (opponent-hidden info, 8 floats, critic-only). `Program.cs` is a line-based stdio JSON
+  server: `reset` / `step <idx>` → `{tokens[T,18], priv[8], actions[N,20], reward, done}`.
 - **`env.py`**: subprocess wrapper around that server.
-- **`ppo.py`**: `ActorCritic` (state encoder → value head + per-action scorer over
-  `concat(state_emb, action_feat)`, softmax over the legal set), rollout collection, GAE,
-  clipped PPO update, entropy bonus.
+- **`ppo.py`**: `EntityEncoder` (a small **transformer** over the entity-token set,
+  permutation-invariant, masked mean-pool → state embedding) feeding `ActorCritic` (action
+  scorer over `concat(state_emb, action_feat)` + privileged value head), rollout, GAE,
+  clipped PPO, entropy bonus.
 
-The state features are the **same 144-float contract** used everywhere else
-(`docs/FEATURES.md`); the action features are new (policy-only).
+### Why a transformer entity-encoder (the "state = time series / sequence" idea)
+
+Two distinct "transformer" opportunities exist; this implements the higher-leverage one:
+- **Entity/set transformer (here)** — attention over the variable set of board/hand entities
+  at the *current* state. Permutation-invariant, any board size, learns relations the flat
+  144-vector can't (cf. AlphaStar's entity encoder). Stateless per decision → deploys like the
+  MLP. This is the "v2" state representation (tokens), separate from the flat `docs/FEATURES.md`
+  contract (still used by the supervised value-net pipeline).
+- **Temporal transformer / LSTM (not done)** — over the *history* of turns, for the POMDP
+  belief state (inferring the opponent's hidden hand/deck). Strong agents (AlphaStar, OpenAI
+  Five, Xiao et al.) use an **LSTM** here for a cheap recurrent state in online RL; add it when
+  self-play at scale makes opponent-modeling pay off. Costs history plumbing at inference.
+
+> Honesty note: at prototype scale (single env, ~20 iterations) the entity encoder is verified
+> to train stably and reach ~0.8 vs random — **on par with the MLP, not proven better**. The
+> representational win shows up with many parallel envs + real self-play, not a 2-minute run.
 
 ## Run
 

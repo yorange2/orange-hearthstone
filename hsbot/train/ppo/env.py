@@ -15,8 +15,8 @@ import subprocess
 
 import numpy as np
 
+TOKEN_DIM = 18  # per entity token (v2 state representation)
 ACT_DIM = 20
-OBS_DIM = 144
 PRIV_DIM = 8  # opponent-hidden features, critic-only (training)
 
 _DEFAULT_DLL = (
@@ -40,18 +40,17 @@ class SabberEnv:
         return json.loads(self.proc.stdout.readline())
 
     @staticmethod
-    def _actions(d: dict) -> np.ndarray:
-        a = d["actions"]
-        return np.asarray(a, dtype=np.float32) if a else np.zeros((0, ACT_DIM), np.float32)
+    def _mat(rows, dim: int) -> np.ndarray:
+        return np.asarray(rows, dtype=np.float32) if rows else np.zeros((0, dim), np.float32)
 
     def reset(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         d = self._rpc("reset")
-        return np.asarray(d["obs"], np.float32), np.asarray(d["priv"], np.float32), self._actions(d)
+        return self._mat(d["tokens"], TOKEN_DIM), np.asarray(d["priv"], np.float32), self._mat(d["actions"], ACT_DIM)
 
     def step(self, idx: int) -> tuple[np.ndarray, np.ndarray, np.ndarray, float, bool]:
         d = self._rpc(f"step {idx}")
-        return (np.asarray(d["obs"], np.float32), np.asarray(d["priv"], np.float32),
-                self._actions(d), float(d["reward"]), bool(d["done"]))
+        return (self._mat(d["tokens"], TOKEN_DIM), np.asarray(d["priv"], np.float32),
+                self._mat(d["actions"], ACT_DIM), float(d["reward"]), bool(d["done"]))
 
     def close(self) -> None:
         try:
