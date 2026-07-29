@@ -136,11 +136,14 @@ def collect(env, main, sample_opp, steps):
     tok, prv, act_, idx_, lp_, v_, r_, d_, hin_, cin_ = ([] for _ in range(10))
     ep_returns = []
 
+    def opp_state(o):
+        return (None, None) if o == "greedy" else o.initial_state()
+
     obs = env.reset()
     main_seat = random.choice((1, 2))
     opp = sample_opp()
     mh, mc = main.initial_state()      # main seat LSTM state
-    oh, oc = opp.initial_state()       # opponent seat LSTM state
+    oh, oc = opp_state(opp)            # opponent seat LSTM state (None for the greedy heuristic)
     last_main = None
     while True:
         if obs.player == main_seat:
@@ -150,10 +153,13 @@ def collect(env, main, sample_opp, steps):
             hin_.append(mh.squeeze(0).numpy()); cin_.append(mc.squeeze(0).numpy())
             last_main = len(idx_) - 1
             mh, mc = nh, nc
+            obs, done, winner = env.step(i)
+        elif opp == "greedy":
+            obs, done, winner = env.step_greedy()
         else:
             i, _, _, oh, oc = act(opp, obs, oh, oc)
+            obs, done, winner = env.step(i)
 
-        obs, done, winner = env.step(i)
         if done:
             if last_main is not None:
                 r = 1.0 if winner == main_seat else (-1.0 if winner != 0 else 0.0)
@@ -166,7 +172,7 @@ def collect(env, main, sample_opp, steps):
             main_seat = random.choice((1, 2))
             opp = sample_opp()
             mh, mc = main.initial_state()
-            oh, oc = opp.initial_state()
+            oh, oc = opp_state(opp)
             last_main = None
 
     return (tok, prv, act_, idx_, lp_, v_, r_, d_, hin_, cin_), ep_returns
@@ -210,7 +216,10 @@ def train(args):
             league.pop(0)
 
     def sample_opp():
-        # current policy (self-play) with prob self_play_prob, else a random past snapshot
+        # greedy heuristic (prob greedy_prob) so the policy trains to beat it; else self-play
+        # (current policy) or a random past league snapshot.
+        if random.random() < args.greedy_prob:
+            return "greedy"
         if not league or random.random() < args.self_play_prob:
             return main
         opp_net.load_state_dict(random.choice(league))
@@ -257,9 +266,9 @@ def train(args):
         if it % args.league_every == 0:
             snapshot()
 
-        sp_wr = float(np.mean([r > 0 for r in ep_returns])) if ep_returns else float("nan")
+        tr_wr = float(np.mean([r > 0 for r in ep_returns])) if ep_returns else float("nan")
         line = (f"iter {it:3d}  league {len(league):2d}  episodes {len(ep_returns):3d}  "
-                f"selfplay_wr {sp_wr:.3f}  pol_loss {pol_loss.item():.3f}  "
+                f"train_wr {tr_wr:.3f}  pol_loss {pol_loss.item():.3f}  "
                 f"val_loss {val_loss.item():.3f}  ent {ent.item():.3f}")
         if it % args.eval_every == 0:
             wr_rand = evaluate(env, main, args.eval_episodes, "random")
@@ -285,6 +294,7 @@ def main():
     ap.add_argument("--vf", type=float, default=0.5)
     ap.add_argument("--ent", type=float, default=0.01)
     # self-play league
+    ap.add_argument("--greedy-prob", type=float, default=0.3, help="prob. opponent is the greedy heuristic")
     ap.add_argument("--self-play-prob", type=float, default=0.5, help="prob. opponent is the current policy")
     ap.add_argument("--league-every", type=int, default=5, help="snapshot the policy into the league every N iters")
     ap.add_argument("--league-size", type=int, default=10, help="max snapshots kept")
