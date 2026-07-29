@@ -28,6 +28,7 @@ class Obs:
     priv: np.ndarray     # [PRIV_DIM]  (critic-only)
     actions: np.ndarray  # [N, ACT_DIM]
     player: int          # 1 or 2 — whose turn it is
+    potential: float     # normalized board score Φ ∈ [-1,1] (reward shaping)
 
 _DEFAULT_DLL = (
     pathlib.Path(__file__).resolve().parents[2]
@@ -36,10 +37,10 @@ _DEFAULT_DLL = (
 
 
 class SabberEnv:
-    def __init__(self, seed: int = 1, dll: str | None = None, dotnet: str = "dotnet"):
+    def __init__(self, seed: int = 1, fixed_deck: bool = False, dll: str | None = None, dotnet: str = "dotnet"):
         dll_path = str(dll or _DEFAULT_DLL)
         self.proc = subprocess.Popen(
-            [dotnet, dll_path, str(seed)],
+            [dotnet, dll_path, str(seed), "1" if fixed_deck else "0"],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1,
         )
 
@@ -55,7 +56,7 @@ class SabberEnv:
 
     def _obs(self, d: dict) -> "Obs":
         return Obs(self._mat(d["tokens"], TOKEN_DIM), np.asarray(d["priv"], np.float32),
-                   self._mat(d["actions"], ACT_DIM), int(d["player"]))
+                   self._mat(d["actions"], ACT_DIM), int(d["player"]), float(d["potential"]))
 
     def reset(self) -> "Obs":
         return self._obs(self._rpc("reset"))

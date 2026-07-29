@@ -30,13 +30,22 @@ public sealed class HearthstoneEnv
     };
 
     private readonly Random _rnd;
+    private readonly bool _fixedDeck;
     private const int MaxDecisions = 800; // safety cap; HS games terminate via fatigue anyway
+    private const double PotentialScale = 200.0;
+
+    // MidRangeScore reused as the shaping potential Φ (same heuristic the greedy opponent uses).
+    private readonly SabberStoneBasicAI.Score.Score _potentialScorer = new SabberStoneBasicAI.Score.MidRangeScore();
 
     private Game _game = null!;
     private List<SabberStoneCore.Tasks.PlayerTasks.PlayerTask> _legal = new();
     private int _decisions;
 
-    public HearthstoneEnv(int seed) => _rnd = new Random(seed);
+    public HearthstoneEnv(int seed, bool fixedDeck = false)
+    {
+        _rnd = new Random(seed);
+        _fixedDeck = fixedDeck;
+    }
 
     /// <summary>Entity tokens for the current decision point: [numTokens, TokenDim].</summary>
     public float[][] Tokens { get; private set; } = System.Array.Empty<float[]>();
@@ -53,14 +62,22 @@ public sealed class HearthstoneEnv
     /// <summary>Winner PlayerId (1/2) once the game is over, else 0.</summary>
     public int Winner { get; private set; }
 
+    /// <summary>Normalized board-score potential Φ ∈ [-1,1] for the current mover (reward shaping).</summary>
+    public float Potential { get; private set; }
+
     public void Reset()
     {
+        // Fixed-deck mode: a Mage mirror with a deterministic 30-card fill (only draw order
+        // varies) — big variance reduction vs random classes + random fill.
+        CardClass p1 = _fixedDeck ? CardClass.MAGE : Classes[_rnd.Next(Classes.Length)];
+        CardClass p2 = _fixedDeck ? CardClass.MAGE : Classes[_rnd.Next(Classes.Length)];
         _game = new Game(new GameConfig
         {
             StartPlayer = _rnd.Next(1, 3),
-            Player1HeroClass = Classes[_rnd.Next(Classes.Length)],
-            Player2HeroClass = Classes[_rnd.Next(Classes.Length)],
+            Player1HeroClass = p1,
+            Player2HeroClass = p2,
             FillDecks = true,
+            FillDecksPredictably = _fixedDeck,
             Shuffle = true,
             SkipMulligan = true,
             Logging = false,
@@ -109,5 +126,7 @@ public sealed class HearthstoneEnv
         LegalActionFeatures = feats;
         Privileged = PrivilegedEncoder.Encode(_game.CurrentOpponent);
         Tokens = TokenEncoder.Encode(_game);
+        _potentialScorer.Controller = me;
+        Potential = (float)System.Math.Tanh(_potentialScorer.Rate() / PotentialScale);
     }
 }

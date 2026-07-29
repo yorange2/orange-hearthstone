@@ -24,11 +24,20 @@ signal; a competent one-ply greedy heuristic is a much higher bar this prototype
 
 **Training against the greedy agent (curriculum)** — the greedy heuristic is now a training
 opponent too (`--greedy-prob`, default 0.3), not just an eval. It helps: over 30 iters,
-vs-greedy rose from ~0.00-0.05 to **~0.15-0.20** (3-4×). But it still loses ~80-85% — 30 iters
-on a single CPU env (~23k samples) is far too little. So the mechanism/curriculum is right; the
-remaining wall is **throughput** (many parallel envs, more iterations, real decks). The value
-of this benchmark is that it replaced wishful "beats random" with the truth, and gives a real
-target to optimize.
+vs-greedy rose from ~0.00-0.05 to **~0.15-0.20** (3-4×). But it still loses ~80-85%.
+
+**Sample-efficiency levers — reward shaping + fixed decks** (`--shaping-coef` 0.1,
+`--fixed-deck`). Potential-based shaping `F = coef*(γ·Φ' − Φ)` densifies the sparse ±1 reward
+with the board score (Φ = tanh(MidRangeScore/200), policy-invariant per Ng et al. 1999); fixed
+decks (Mage mirror + deterministic fill) slash variance. Effect over 30 iters: **vs-random
+jumped to ~0.93** (best yet), but **vs-greedy stayed ~0.10-0.15** — no breakthrough on the
+strong opponent.
+
+So every non-compute lever (curriculum, shaping, fixed decks) picks the low-hanging fruit
+(beats random handily) but **does not crack the greedy heuristic at ~25k samples**. The wall is
+genuinely **throughput** — the paper-level results needed millions-to-billions of frames, and a
+single CPU stdio env is orders of magnitude short. Next real lever = many parallel envs + GPU,
+not more tweaks or a bigger model.
 
 ## Pieces
 

@@ -9,7 +9,8 @@ using SabberStoneEnv;
 // `priv` is the current mover's opponent-hidden info (critic-only). Swap stdio for gRPC to scale.
 
 int seed = args.Length > 0 ? int.Parse(args[0]) : 1;
-var env = new HearthstoneEnv(seed);
+bool fixedDeck = args.Length > 1 && args[1] == "1";
+var env = new HearthstoneEnv(seed, fixedDeck);
 var jsonOpts = new JsonSerializerOptions
 {
     PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
@@ -50,7 +51,7 @@ void Write(HearthstoneEnv e, bool done)
     var resp = new Response
     {
         Tokens = e.Tokens, Priv = e.Privileged, Actions = e.LegalActionFeatures,
-        Player = e.CurrentPlayerId, Done = done, Winner = e.Winner,
+        Player = e.CurrentPlayerId, Potential = e.Potential, Done = done, Winner = e.Winner,
     };
     stdout.WriteLine(JsonSerializer.Serialize(resp, jsonOpts));
     stdout.Flush();
@@ -62,6 +63,7 @@ sealed class Response
     public float[] Priv { get; set; } = System.Array.Empty<float>();
     public float[][] Actions { get; set; } = System.Array.Empty<float[]>();
     public int Player { get; set; }
+    public float Potential { get; set; }
     public bool Done { get; set; }
     public int Winner { get; set; }
 }
