@@ -48,6 +48,30 @@ python ppo.py --dotnet /path/to/dotnet --dll ../../trainer/SabberStoneEnv/bin/Re
 
 Saves `ppo_policy.pt`.
 
+## Improvements from Xiao et al. 2023
+
+Techniques from *"Mastering Strategy Card Game (Hearthstone) with Improved Techniques"*
+(IEEE CoG 2023, [arXiv:2303.05197](https://arxiv.org/abs/2303.05197)), whose ablation
+reports per-technique win-rate gains at scale.
+
+**Implemented here:**
+- **γ = 1.0** (was 0.99). Episodes are short with only a terminal ±1 reward, so the
+  undiscounted return faithfully recovers win/loss. Paper: **+7%**.
+- **Privileged (asymmetric) critic** — the "Cheat" technique. The value head additionally
+  sees `priv` = opponent-hidden features (`PrivilegedEncoder`: hand aggregates + deck count);
+  the policy stays observable-only. Because the critic is unused at inference there is **no
+  train/test gap** (cleaner than the paper's asymmetric-`n` scheme). Paper: **+5.5%**.
+
+> Honesty note: at this prototype scale (single env, ~20 noisy iterations) these are verified
+> to integrate cleanly and keep the agent learning (~0.85+ vs random) — but the *magnitude* of
+> the paper's gains is only measurable with many parallel envs, many seeds, and thousands of
+> eval games. Treat them as correctly-wired, not yet A/B-proven here.
+
+**Mapped but not yet done** (bigger lifts): improved V-Trace (ρ̄>1 + ρ floor + PPO-clip on a
+V-Trace target) and off-policy queue balancing — both only matter once training is
+distributed/off-policy; per-hero model isolation; auto-regressive action decomposition with
+shared card/hero embeddings; and OSFP self-play (vs the current random opponent).
+
 ## This is a prototype — upgrade paths
 
 - **Opponent**: random → self-play with an **opponent pool / league** (avoids cycling).
