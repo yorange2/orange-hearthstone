@@ -26,9 +26,12 @@ git clone --depth 1 https://github.com/HearthSim/SabberStone.git vendor/SabberSt
 
 ## Run
 
+Use the **.NET 8 SDK** — SabberStone's source does not compile under the .NET 10 SDK
+(a `Span`→`IList` overload-resolution change in their `SpecificTask.cs`).
+
 ```
 cd hsbot/trainer
-dotnet test                                   # parity test — do this first
+dotnet test SabberStoneGen.Tests/SabberStoneGen.Tests.csproj   # parity test — do this first (3/3)
 dotnet run -c Release --project SabberStoneGen -- 5000 data/selfplay.jsonl 1
 #                                                  ^games ^out              ^seed
 ```

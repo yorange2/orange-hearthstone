@@ -44,6 +44,9 @@ heuristic.
 
 ## Notes
 
+- **Device:** auto-selects `cuda` > `mps` (Apple GPU) > `cpu`; override with `--device cpu`.
+  ONNX export/verify always runs on CPU. For the current tiny MLP + data scale CPU is fine
+  (GPU overhead can make it slower); GPU pays off once data/model grow.
 - Row schema: `{"Label": 0|1, "Features": [144]}` (key casing accepted either way).
 - The model is only as good as the data: current self-play uses a random behavior policy and
   random decks. For a deployable model, regenerate with the real deck and a stronger policy.
