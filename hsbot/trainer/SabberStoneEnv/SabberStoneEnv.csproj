@@ -11,6 +11,8 @@
   <ItemGroup>
     <!-- Reuse ObservableState / FeatureExtractor / SabberStoneObserver, and SabberStoneCore. -->
     <ProjectReference Include="..\SabberStoneGen\SabberStoneGen.csproj" />
+    <!-- SabberStone's baseline scoring AI, for the greedy heuristic benchmark opponent. -->
+    <ProjectReference Include="..\..\..\vendor\SabberStone\core-extensions\SabberStoneBasicAI\SabberStoneBasicAI.csproj" />
   </ItemGroup>
 
 </Project>

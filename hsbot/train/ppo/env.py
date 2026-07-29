@@ -65,6 +65,11 @@ class SabberEnv:
         d = self._rpc(f"step {idx}")
         return self._obs(d), bool(d["done"]), int(d["winner"])
 
+    def step_greedy(self) -> tuple["Obs", bool, int]:
+        """The env plays the current mover's greedy (MidRangeScore) heuristic action."""
+        d = self._rpc("step_greedy")
+        return self._obs(d), bool(d["done"]), int(d["winner"])
+
     def close(self) -> None:
         try:
             assert self.proc.stdin

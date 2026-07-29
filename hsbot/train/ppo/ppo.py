@@ -173,8 +173,10 @@ def collect(env, main, sample_opp, steps):
 
 
 @torch.no_grad()
-def evaluate(env, main, episodes):
-    """Absolute benchmark: main policy (recurrent) vs a uniform-random opponent. Win rate."""
+def evaluate(env, main, episodes, opponent="random"):
+    """Benchmark the recurrent main policy vs a fixed opponent. Returns win rate.
+    opponent="random" (weak baseline) or "greedy" (SabberStone MidRangeScore heuristic — the
+    honest 基础策略-analogue benchmark)."""
     wins = 0
     for _ in range(episodes):
         obs = env.reset()
@@ -183,9 +185,11 @@ def evaluate(env, main, episodes):
         while True:
             if obs.player == seat:
                 i, _, _, mh, mc = act(main, obs, mh, mc)
+                obs, done, winner = env.step(i)
+            elif opponent == "greedy":
+                obs, done, winner = env.step_greedy()
             else:
-                i = int(np.random.randint(obs.actions.shape[0]))
-            obs, done, winner = env.step(i)
+                obs, done, winner = env.step(int(np.random.randint(obs.actions.shape[0])))
             if done:
                 wins += int(winner == seat)
                 break
@@ -258,7 +262,9 @@ def train(args):
                 f"selfplay_wr {sp_wr:.3f}  pol_loss {pol_loss.item():.3f}  "
                 f"val_loss {val_loss.item():.3f}  ent {ent.item():.3f}")
         if it % args.eval_every == 0:
-            line += f"  [eval vs random {evaluate(env, main, args.eval_episodes):.3f}]"
+            wr_rand = evaluate(env, main, args.eval_episodes, "random")
+            wr_greedy = evaluate(env, main, args.eval_greedy_episodes, "greedy")
+            line += f"  [vs random {wr_rand:.3f} | vs greedy {wr_greedy:.3f}]"
         print(line)
 
     torch.save(main.state_dict(), args.out)
@@ -284,6 +290,7 @@ def main():
     ap.add_argument("--league-size", type=int, default=10, help="max snapshots kept")
     ap.add_argument("--eval-every", type=int, default=5)
     ap.add_argument("--eval-episodes", type=int, default=40)
+    ap.add_argument("--eval-greedy-episodes", type=int, default=20, help="fewer: greedy sim is slower")
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--out", type=str, default="ppo_policy.pt")
     ap.add_argument("--dll", type=str, default=None)

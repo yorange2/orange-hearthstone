@@ -5,20 +5,27 @@ SabberStone. RL path "A": a **masked action-scoring policy** over the variable l
 set, built on a **transformer entity-encoder + LSTM belief state**, driven through a simple
 stdio bridge to the C# engine.
 
-## Result
+## Result — and an honest benchmark vs a heuristic
 
-25 iterations of self-play (~2.5k games, a few minutes on CPU). Self-play win-rate hovers
-~0.6 (it plays near-equal past selves); the real signal is the periodic **eval vs a random
-opponent it never trains against**:
+25 iterations of self-play (prototype scale, a few minutes on CPU), evaluated against **two**
+fixed opponents: uniform-random (weak) and a **greedy heuristic** (SabberStone's own
+`MidRangeScore`, one-ply lookahead — the SabberStone analogue of Hearthstone-Script's `基础策略`):
 
 ```
-iter  5  selfplay_wr 0.61  [eval vs random 0.53]
-iter 10  selfplay_wr 0.59  [eval vs random 0.77]
-iter 15  selfplay_wr 0.73  [eval vs random 0.77]
-iter 25  selfplay_wr 0.71  [eval vs random 0.80]
+iter  5   [vs random 0.60 | vs greedy 0.05]
+iter 15   [vs random 0.70 | vs greedy 0.10]
+iter 20   [vs random 0.63 | vs greedy 0.20]
+iter 25   [vs random 0.83 | vs greedy 0.05]
 ```
 
-Pure self-play → generalizes to ~0.80 vs random. (Prototype scale; not a tuned result.)
+**The prototype beats random ~80% but loses ~85-95% to the greedy heuristic.** So: does it
+outperform `基础策略`-style play? **No — not at this scale.** "Beats random" is a near-useless
+signal; a competent one-ply greedy heuristic is a much higher bar this prototype doesn't clear.
+
+Closing the gap is a *scale + curriculum* problem, not an architecture one: put the greedy
+agent (and stronger snapshots) into the training league so the policy actually trains against
+it, run many parallel envs for far more samples, use real decks, and lengthen training — see
+below. The value of this benchmark is that it replaces wishful "beats random" with the truth.
 
 ## Pieces
 
@@ -27,7 +34,8 @@ Pure self-play → generalizes to ~0.80 vs random. (Prototype scale; not a tuned
   `player` (whose turn), and Python routes it. Encoders: `TokenEncoder` (state = a **set** of
   entity tokens, 18 floats each — hero/minions/hand/weapon/hero-power), `ActionEncoder` (each
   legal `PlayerTask` → 20 floats), `PrivilegedEncoder` (opponent-hidden info, 8 floats,
-  critic-only). `Program.cs` stdio JSON server: `reset` / `step <idx>` →
+  critic-only). `GreedyOpponent` plays SabberStone's `MidRangeScore` one-ply for the benchmark.
+  `Program.cs` stdio JSON server: `reset` / `step <idx>` / `step_greedy` →
   `{tokens[T,18], priv[8], actions[N,20], player, done, winner}`.
 - **`env.py`**: subprocess wrapper around that server.
 - **`env.py`**: subprocess wrapper (`Obs` = tokens/priv/actions/player).
@@ -108,8 +116,10 @@ shared card/hero embeddings; and a principled fictitious-play weighting (OSFP) o
 
 ## This is a prototype — upgrade paths
 
-- **League**: single-population self-play (done) → AlphaStar-style **main / exploiter /
-  main-exploiter** populations + prioritized/fictitious-play opponent sampling (OSFP).
+- **League**: single-population self-play (done) → **train against the greedy heuristic**
+  (add it as a league opponent, not just an eval) and AlphaStar-style **main / exploiter /
+  main-exploiter** populations + prioritized/fictitious-play opponent sampling (OSFP). This is
+  the direct lever to actually beat the greedy benchmark above.
 - **Reward**: terminal ±1 only → add **board-score shaping** for denser signal.
 - **Imperfect info / RNG**: currently handled implicitly via the observable features; add
   **determinization / ISMCTS** for search-based strength (AlphaZero path "B").
