@@ -41,6 +41,7 @@
     <build>
         <finalName>${project.artifactId}</finalName>
         <sourceDirectory>src/main/kotlin</sourceDirectory>
+        <testSourceDirectory>src/test/kotlin</testSourceDirectory>
         <resources>
             <resource>
                 <directory>src/main/resources-filtered</directory>
@@ -81,7 +82,14 @@
     </build>
 
     <dependencies>
-        <!-- Brings in the strategy SDK, and transitively the card SDK (War, MCTSArg, ScoreCalculator, ...). -->
+        <!-- Brings in the strategy SDK, and transitively the card/plugin/base SDKs (War, MCTSArg,
+             ScoreCalculator, ...). These SDK modules override their groupId to com.github.xjw580 with
+             independent versions and reference each other by that group. jitpack cannot produce them
+             (no matching standalone git tags), so build them from the vendor/ sources into ~/.m2:
+               for m in hs-script-base hs-script-plugin-sdk hs-script-card-sdk hs-script-strategy-sdk; do
+                 mvn -s <jitpack-settings> -f vendor/$m/pom.xml install -DskipTests
+               done
+             (CI does the equivalent.) -->
         <dependency>
             <groupId>com.github.xjw580</groupId>
             <artifactId>hs-script-strategy-sdk</artifactId>

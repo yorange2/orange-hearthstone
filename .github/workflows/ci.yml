@@ -1,0 +1,78 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  # Python: verify the committed fixtures still match the reference extractor, and that the
+  # train + ONNX-export pipeline runs (synthetic data).
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r hsbot/train/requirements.txt
+      - name: fixtures match the reference extractor
+        run: |
+          python hsbot/train/reference_features.py
+          git diff --exit-code hsbot/fixtures
+      - name: train smoke + ONNX export/verify
+        run: python hsbot/train/train.py --smoke 8000 --epochs 5 --out /tmp/value_net.v1.onnx
+
+  # C#: feature-parity xUnit test against the shared fixtures. Needs the SabberStone clone.
+  dotnet:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+      - name: clone SabberStone (vendor)
+        run: git clone --depth 1 https://github.com/HearthSim/SabberStone.git vendor/SabberStone
+      - name: dotnet test
+        run: dotnet test hsbot/trainer/SabberStoneGen.Tests/SabberStoneGen.Tests.csproj -c Release
+
+  # Kotlin: plugin build + feature-parity JUnit test. The SDK submodules can't be resolved
+  # from jitpack (they override groupId to com.github.xjw580 with independent versions and no
+  # matching standalone git tags), so we build them from source into the local repo. They
+  # target Java 25, so JDK 25 is required. Best-effort (does not gate the others) until proven
+  # green on a real run — then flip continue-on-error off.
+  kotlin:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "25"
+      - name: maven settings (jitpack for parent POM resolution)
+        run: |
+          mkdir -p ~/.m2
+          cat > ~/.m2/settings.xml <<'XML'
+          <settings>
+            <profiles>
+              <profile>
+                <id>jitpack</id>
+                <repositories>
+                  <repository><id>central</id><url>https://repo1.maven.org/maven2/</url></repository>
+                  <repository><id>jitpack.io</id><url>https://jitpack.io</url></repository>
+                </repositories>
+              </profile>
+            </profiles>
+            <activeProfiles><activeProfile>jitpack</activeProfile></activeProfiles>
+          </settings>
+          XML
+      - name: build + install HS-Script SDK modules from source
+        run: |
+          set -e
+          for m in hs-script-base hs-script-plugin-sdk hs-script-card-sdk hs-script-strategy-sdk; do
+            git clone --depth 1 "https://github.com/xjw580/$m.git" "vendor/$m"
+            mvn -B -f "vendor/$m/pom.xml" install -DskipTests
+          done
+      - name: mvn test (plugin)
+        run: mvn -B -f hsbot/hs-plugin/pom.xml test

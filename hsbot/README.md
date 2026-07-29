@@ -35,11 +35,18 @@ hsbot/
 
 ## Build (plugin)
 
-The plugin uses the same parent POM as the official template
-(`com.github.xjw580.Hearthstone-Script:hs-script:v4.16.3-GA`, resolved via jitpack), so it
-must be built either inside a checkout of Hearthstone-Script or with that parent available.
-It is **skeleton code**: it compiles against the real SDK jars, not verified headless here —
-a first `mvn -pl hs-plugin package` against the pinned SDK version is the next build step.
+Verified building + testing on **JDK 25+** (the HS-Script SDK modules target Java 25) with the
+parent POM `com.github.xjw580.Hearthstone-Script:hs-script:v4.16.3-GA` resolved from jitpack.
+The SDK modules themselves are **not** on jitpack, so build them from source into `~/.m2`
+first (a jitpack `settings.xml` is needed so the parent resolves):
+
+```
+for m in hs-script-base hs-script-plugin-sdk hs-script-card-sdk hs-script-strategy-sdk; do
+  git clone --depth 1 https://github.com/xjw580/$m.git vendor/$m
+  mvn -s settings.xml -f vendor/$m/pom.xml install -DskipTests
+done
+mvn -s settings.xml -f hsbot/hs-plugin/pom.xml test   # → parity test 3/3
+```
 
 Drop the trained model at `~/.hs-script/models/value_net.v1.onnx`. If it's missing or fails
 to load, the strategy falls back to HS-Script's built-in heuristic so the bot still runs.
@@ -51,9 +58,12 @@ to load, the strategy falls back to HS-Script's built-in heuristic so the bot st
 - [x] Parity fixtures (`fixtures/*.json`, 3) + Python reference + Kotlin parity test
 - [x] C# SabberStone self-play generator + extractor + xUnit parity test
 - [x] Python value net + training loop + ONNX export/verify
+- [x] **All three build/test green locally** — Kotlin parity 3/3, C# parity 3/3, Python train+ONNX; C# self-play verified (11k rows @ ~470 games/s), real-data train val_acc 0.67
 - [ ] Real deck code wired into `ValueNetStrategyDeck.deckCode()`
-- [ ] First real builds: `mvn -pl hs-plugin test` (Kotlin), `dotnet test` (C#), `python train.py --smoke` (Py)
-- [ ] Generate data → train → drop `value_net.v1.onnx` → run live
+- [ ] Scale data + stronger policy → train real model → drop `value_net.v1.onnx` → run live on Windows
+
+> Toolchains: **.NET 8** (SabberStone won't compile on .NET 10), **JDK 25+** for the plugin,
+> Python 3.9+ with `torch`. See per-stage READMEs.
 
 ## Pipeline (end to end)
 

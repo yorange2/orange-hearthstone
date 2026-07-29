@@ -12,7 +12,7 @@ import kotlin.streams.toList
  * Parity guard: the Kotlin [WarFeatureExtractor] must reproduce every fixture's `expected`
  * vector within 1e-6. The same fixtures gate the C# extractor, keeping the two in lockstep.
  *
- * Fixtures live at repo `hsbot/fixtures/*.json`; resolved relative to this module.
+ * Fixtures live in repo `hsbot/fixtures` (JSON files); resolved relative to this module.
  */
 class FeatureParityTest {
 

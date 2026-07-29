@@ -8,7 +8,7 @@ import club.xiaojiawei.hsscriptcardsdk.bean.War
  *
  * Produces a fixed-length 144 float vector from an HS-Script [War], from the perspective
  * of `war.me` (the player whose turn is being optimized). MUST stay byte-identical to the
- * C# `POGameFeatureExtractor`; both are checked against hsbot/fixtures/*.json.
+ * C# `POGameFeatureExtractor`; both are checked against the JSON files in hsbot/fixtures.
  *
  * Any change here is a contract change: bump FEATURES.md version and regenerate fixtures.
  */
