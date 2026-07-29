@@ -6,14 +6,17 @@ using SabberStoneCore.Model.Entities; // Controller
 namespace SabberStoneEnv;
 
 /// <summary>
-/// Single-agent RL environment over SabberStone (learner = player 1; a uniform-random
-/// opponent plays player 2 inside the env). Control returns only at learner decision points:
+/// Seat-agnostic two-player SabberStone env for self-play. It does NOT play any opponent
+/// itself — at every decision point it returns the state from the *current mover's* view and
+/// exposes <see cref="CurrentPlayerId"/>; the Python driver routes each decision to the main
+/// policy or a league opponent and only trains on the main seat's transitions.
 ///
-///   Reset()    -> sets Tokens / Privileged / LegalActionFeatures
-///   Step(idx)  -> (reward, done); updates the same properties
+///   Reset()    -> sets Tokens / Privileged / LegalActionFeatures / CurrentPlayerId
+///   Step(idx)  -> done; on done <see cref="Winner"/> is 1/2/0 (tie). No auto-advance across
+///                 players: after a move the next decision (same or other player) is exposed.
 ///
-/// State is an entity-token SET (TokenEncoder, "v2") for the transformer policy — not the flat
-/// FeatureExtractor vector. Reward is terminal only: +1 win, -1 loss, 0 tie.
+/// State is an entity-token set (TokenEncoder); `Privileged` is the current mover's opponent-
+/// hidden info (critic-only). Reward is derived by the driver from Winner vs the main seat.
 /// </summary>
 public sealed class HearthstoneEnv
 {
@@ -27,8 +30,7 @@ public sealed class HearthstoneEnv
     };
 
     private readonly Random _rnd;
-    private const int LearnerId = 1;
-    private const int MaxDecisions = 500; // safety cap; HS games terminate via fatigue anyway
+    private const int MaxDecisions = 800; // safety cap; HS games terminate via fatigue anyway
 
     private Game _game = null!;
     private List<SabberStoneCore.Tasks.PlayerTasks.PlayerTask> _legal = new();
@@ -45,6 +47,12 @@ public sealed class HearthstoneEnv
     /// <summary>Privileged (opponent-hidden) features for the critic only: [PrivDim].</summary>
     public float[] Privileged { get; private set; } = new float[PrivDim];
 
+    /// <summary>PlayerId (1/2) of the player to move at the current decision point.</summary>
+    public int CurrentPlayerId { get; private set; }
+
+    /// <summary>Winner PlayerId (1/2) once the game is over, else 0.</summary>
+    public int Winner { get; private set; }
+
     public void Reset()
     {
         _game = new Game(new GameConfig
@@ -60,63 +68,43 @@ public sealed class HearthstoneEnv
         });
         _game.StartGame();
         _decisions = 0;
-        AdvanceToLearnerOrEnd();
+        Winner = 0;
         Observe();
     }
 
-    /// <summary>Apply the chosen legal action; returns (reward, done). Reads Tokens/etc. after.</summary>
-    public (float reward, bool done) Step(int actionIndex)
+    /// <summary>Apply the current mover's chosen legal action; returns done. Read props after.</summary>
+    public bool Step(int actionIndex)
     {
         if (actionIndex < 0 || actionIndex >= _legal.Count)
             actionIndex = 0; // defensive; caller should only pass legal indices
 
         _game.Process(_legal[actionIndex]);
         _decisions++;
-        AdvanceToLearnerOrEnd();
 
         if (_game.State == State.COMPLETE || _decisions >= MaxDecisions)
         {
+            Winner = _game.Player1.PlayState == PlayState.WON ? 1
+                   : _game.Player2.PlayState == PlayState.WON ? 2 : 0;
             Tokens = System.Array.Empty<float[]>();
             LegalActionFeatures = System.Array.Empty<float[]>();
             Privileged = new float[PrivDim];
-            return (TerminalReward(), true);
+            return true;
         }
 
         Observe();
-        return (0f, false);
-    }
-
-    // Play random opponent moves until it's the learner's turn again or the game ends.
-    private void AdvanceToLearnerOrEnd()
-    {
-        while (_game.State == State.RUNNING && _game.CurrentPlayer.PlayerId != LearnerId)
-        {
-            var opts = _game.CurrentPlayer.Options();
-            if (opts.Count == 0) break;
-            _game.Process(opts[_rnd.Next(opts.Count)]);
-        }
+        return false;
     }
 
     private void Observe()
     {
-        _legal = _game.CurrentPlayer.Options();
-        var feats = new float[_legal.Count][];
         Controller me = _game.CurrentPlayer;
+        CurrentPlayerId = me.PlayerId;
+        _legal = me.Options();
+        var feats = new float[_legal.Count][];
         for (int i = 0; i < _legal.Count; i++)
             feats[i] = ActionEncoder.Encode(_legal[i], me);
         LegalActionFeatures = feats;
         Privileged = PrivilegedEncoder.Encode(_game.CurrentOpponent);
         Tokens = TokenEncoder.Encode(_game);
-    }
-
-    private float TerminalReward()
-    {
-        var learner = _game.Player1.PlayerId == LearnerId ? _game.Player1 : _game.Player2;
-        return learner.PlayState switch
-        {
-            PlayState.WON => 1f,
-            PlayState.LOST or PlayState.CONCEDED => -1f,
-            _ => 0f,
-        };
     }
 }
