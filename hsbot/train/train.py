@@ -69,8 +69,6 @@ def main() -> None:
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--val-split", type=float, default=0.1)
     ap.add_argument("--smoke", type=int, default=0, help="train on N synthetic rows instead of --data")
-    ap.add_argument("--hidden", type=int, nargs="+", default=[256, 128],
-                    help="hidden layer sizes, e.g. --hidden 512 256 128")
     ap.add_argument("--device", choices=["auto", "cpu", "cuda", "mps"], default="auto",
                     help="compute device; 'auto' picks cuda > mps > cpu")
     args = ap.parse_args()
@@ -95,7 +93,7 @@ def main() -> None:
     xv, yv = torch.from_numpy(x[vi]).to(device), torch.from_numpy(y[vi]).to(device)
 
     loader = DataLoader(TensorDataset(xt, yt), batch_size=args.batch, shuffle=True)
-    model = ValueNet(dim=FEATURE_DIM, hidden=tuple(args.hidden)).to(device)
+    model = ValueNet().to(device)
     opt = torch.optim.Adam(model.parameters(), lr=args.lr)
     loss_fn = torch.nn.BCEWithLogitsLoss()
 
