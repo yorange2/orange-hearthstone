@@ -16,6 +16,7 @@ data/
 
 # Trained models / large artifacts
 *.onnx
+*.pt
 models/
 
 # Python
