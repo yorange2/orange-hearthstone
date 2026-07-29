@@ -2,7 +2,8 @@
 
 A working **PPO** agent that learns Hearthstone by **self-play with an opponent league** in
 SabberStone. RL path "A": a **masked action-scoring policy** over the variable legal-action
-set, over a transformer entity-encoder, driven through a simple stdio bridge to the C# engine.
+set, built on a **transformer entity-encoder + LSTM belief state**, driven through a simple
+stdio bridge to the C# engine.
 
 ## Result
 
@@ -31,8 +32,9 @@ Pure self-play → generalizes to ~0.80 vs random. (Prototype scale; not a tuned
 - **`env.py`**: subprocess wrapper around that server.
 - **`env.py`**: subprocess wrapper (`Obs` = tokens/priv/actions/player).
 - **`ppo.py`**: `EntityEncoder` (a small **transformer** over the entity-token set,
-  permutation-invariant, masked mean-pool → state embedding) feeding `ActorCritic` (action
-  scorer over `concat(state_emb, action_feat)` + privileged value head); **self-play league**
+  permutation-invariant, masked mean-pool → per-state embedding) → **LSTM belief state**
+  (recurrent over the agent's decisions within a game) → `ActorCritic` (action scorer over
+  `concat(belief, action_feat)` + privileged value head); **self-play league**
   (`collect` drives both seats — main policy stored, sampled opponent not; `snapshot`/
   `sample_opp` manage the pool of past policies); GAE, clipped PPO, entropy bonus; `evaluate`
   benchmarks vs random.
@@ -54,10 +56,13 @@ Two distinct "transformer" opportunities exist; this implements the higher-lever
   144-vector can't (cf. AlphaStar's entity encoder). Stateless per decision → deploys like the
   MLP. This is the "v2" state representation (tokens), separate from the flat `docs/FEATURES.md`
   contract (still used by the supervised value-net pipeline).
-- **Temporal transformer / LSTM (not done)** — over the *history* of turns, for the POMDP
-  belief state (inferring the opponent's hidden hand/deck). Strong agents (AlphaStar, OpenAI
-  Five, Xiao et al.) use an **LSTM** here for a cheap recurrent state in online RL; add it when
-  self-play at scale makes opponent-modeling pay off. Costs history plumbing at inference.
+- **Temporal LSTM belief state (done)** — an `nn.LSTMCell` carries a recurrent state across
+  the agent's decisions within a game, summarising history into a belief the heads condition
+  on (Hearthstone is a POMDP: hidden opponent hand/deck). LSTM, not transformer-over-time, for
+  a cheap per-step recurrent state in online RL (as in AlphaStar / OpenAI Five / Xiao et al.).
+  Recurrence uses R2D2 **stored-state** (each transition keeps its LSTM input state; the PPO
+  update recomputes one step from it, so minibatches stay per-transition — no BPTT through
+  time). At inference the plugin must carry the hidden state across the game's decisions.
 
 > Honesty note: at prototype scale (single env, ~20 iterations) the entity encoder is verified
 > to train stably and reach ~0.8 vs random — **on par with the MLP, not proven better**. The
