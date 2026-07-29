@@ -95,6 +95,9 @@ public sealed class HearthstoneEnv
         return false;
     }
 
+    /// <summary>Step by playing the current mover's greedy (MidRangeScore) heuristic action.</summary>
+    public bool StepGreedy() => Step(GreedyOpponent.BestAction(_game));
+
     private void Observe()
     {
         Controller me = _game.CurrentPlayer;

@@ -28,6 +28,11 @@ while ((line = Console.In.ReadLine()) != null)
         env.Reset();
         Write(env, false);
     }
+    else if (line == "step_greedy")
+    {
+        bool done = env.StepGreedy();  // env plays the current mover's greedy heuristic action
+        Write(env, done);
+    }
     else if (line.StartsWith("step"))
     {
         int idx = int.Parse(line.AsSpan(4).Trim());
