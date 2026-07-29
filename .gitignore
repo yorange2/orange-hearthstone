@@ -6,6 +6,14 @@ target/
 **/target/
 *.class
 
+# .NET
+bin/
+obj/
+
+# Generated training data
+data/
+*.jsonl
+
 # Trained models / large artifacts
 *.onnx
 models/
