@@ -23,8 +23,10 @@ hsbot/
       TestWarBuilder.kt           # builds a War from a neutral fixture state
       FeatureParityTest.kt        # asserts extractor == fixtures within 1e-6
     src/main/resources/META-INF/services/   # plugin + strategy registration
-  train/               # Python — value net + ONNX export                     (TODO)
+  train/               # Python — value net + ONNX export                (DONE: scaffold)
     reference_features.py         # independent ground-truth extractor + fixture generator
+    model.py                      # ValueNet (144→256→128→1, sigmoid win-prob head)
+    train.py                      # JSONL → train (BCE) → export+verify ONNX
   trainer/             # C#  — SabberStone self-play + feature/label dumper (DONE: scaffold)
     SabberStoneGen/               # console: ObservableState, FeatureExtractor,
                                   #   SabberStoneObserver, SelfPlayGenerator, Program
@@ -48,9 +50,19 @@ to load, the strategy falls back to HS-Script's built-in heuristic so the bot st
 - [x] Kotlin plugin skeleton (strategy + ONNX ScoreCalculator + feature extractor)
 - [x] Parity fixtures (`fixtures/*.json`, 3) + Python reference + Kotlin parity test
 - [x] C# SabberStone self-play generator + extractor + xUnit parity test
-- [ ] Python training + ONNX export
+- [x] Python value net + training loop + ONNX export/verify
 - [ ] Real deck code wired into `ValueNetStrategyDeck.deckCode()`
-- [ ] First real builds: `mvn -pl hs-plugin test` (Kotlin) and `dotnet test` (C#)
+- [ ] First real builds: `mvn -pl hs-plugin test` (Kotlin), `dotnet test` (C#), `python train.py --smoke` (Py)
+- [ ] Generate data → train → drop `value_net.v1.onnx` → run live
+
+## Pipeline (end to end)
+
+```
+SabberStone self-play (C#)  --JSONL-->  train.py  --value_net.v1.onnx-->  HS-Script plugin (Kotlin)
+   trainer/                              train/                            hs-plugin/
+   observable-only features ----- same 144-float contract (docs/FEATURES.md) -----
+   validated by:  FeatureParityTests.cs  |  reference_features.py  |  FeatureParityTest.kt
+```
 
 ## Caveats
 
