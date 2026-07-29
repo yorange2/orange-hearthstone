@@ -2,34 +2,30 @@ using SabberStoneCore.Config;
 using SabberStoneCore.Enums;
 using SabberStoneCore.Model;
 using SabberStoneCore.Model.Entities; // Controller
-using SabberStoneGen; // FeatureExtractor, SabberStoneObserver (state features + contract)
 
 namespace SabberStoneEnv;
 
 /// <summary>
-/// Single-agent RL environment over SabberStone: the learning agent controls player 1; the
-/// opponent (player 2) plays a fixed uniform-random policy inside the env. Control returns to
-/// the caller only at the learner's decision points, so from the outside it's a clean MDP:
+/// Single-agent RL environment over SabberStone (learner = player 1; a uniform-random
+/// opponent plays player 2 inside the env). Control returns only at learner decision points:
 ///
-///   Reset()      -> Observation (state features + legal-action features)
-///   Step(idx)    -> Observation', reward, done
+///   Reset()    -> sets Tokens / Privileged / LegalActionFeatures
+///   Step(idx)  -> (reward, done); updates the same properties
 ///
-/// Reward is terminal only: +1 win, -1 loss, 0 tie. Observations are the 144-float contract
-/// vector (from the learner's perspective); actions are ActionEncoder vectors, one per legal
-/// PlayerTask. Upgrade paths: self-play opponent / opponent pool, reward shaping.
+/// State is an entity-token SET (TokenEncoder, "v2") for the transformer policy — not the flat
+/// FeatureExtractor vector. Reward is terminal only: +1 win, -1 loss, 0 tie.
 /// </summary>
 public sealed class HearthstoneEnv
 {
-    public const int ObsDim = FeatureExtractor.Length; // 144
-    public const int ActDim = ActionEncoder.Dim;       // 20
-    public const int PrivDim = PrivilegedEncoder.Dim;  // 8 (critic-only, training)
+    public const int TokenDim = TokenEncoder.Dim;      // 18 (per entity)
+    public const int ActDim = ActionEncoder.Dim;       // 20 (per legal action)
+    public const int PrivDim = PrivilegedEncoder.Dim;  // 8  (critic-only, training)
 
     private static readonly CardClass[] Classes =
     {
         CardClass.MAGE, CardClass.HUNTER, CardClass.WARRIOR, CardClass.PALADIN,
     };
 
-    private readonly SabberStoneObserver _observer = new();
     private readonly Random _rnd;
     private const int LearnerId = 1;
     private const int MaxDecisions = 500; // safety cap; HS games terminate via fatigue anyway
@@ -40,13 +36,16 @@ public sealed class HearthstoneEnv
 
     public HearthstoneEnv(int seed) => _rnd = new Random(seed);
 
-    /// <summary>Legal-action feature matrix for the current decision point: [numActions, ActDim].</summary>
+    /// <summary>Entity tokens for the current decision point: [numTokens, TokenDim].</summary>
+    public float[][] Tokens { get; private set; } = System.Array.Empty<float[]>();
+
+    /// <summary>Legal-action features: [numActions, ActDim].</summary>
     public float[][] LegalActionFeatures { get; private set; } = System.Array.Empty<float[]>();
 
     /// <summary>Privileged (opponent-hidden) features for the critic only: [PrivDim].</summary>
     public float[] Privileged { get; private set; } = new float[PrivDim];
 
-    public float[] Reset()
+    public void Reset()
     {
         _game = new Game(new GameConfig
         {
@@ -62,11 +61,11 @@ public sealed class HearthstoneEnv
         _game.StartGame();
         _decisions = 0;
         AdvanceToLearnerOrEnd();
-        return Observe();
+        Observe();
     }
 
-    /// <summary>Apply the chosen legal action; returns (observation, reward, done).</summary>
-    public (float[] obs, float reward, bool done) Step(int actionIndex)
+    /// <summary>Apply the chosen legal action; returns (reward, done). Reads Tokens/etc. after.</summary>
+    public (float reward, bool done) Step(int actionIndex)
     {
         if (actionIndex < 0 || actionIndex >= _legal.Count)
             actionIndex = 0; // defensive; caller should only pass legal indices
@@ -77,11 +76,14 @@ public sealed class HearthstoneEnv
 
         if (_game.State == State.COMPLETE || _decisions >= MaxDecisions)
         {
+            Tokens = System.Array.Empty<float[]>();
+            LegalActionFeatures = System.Array.Empty<float[]>();
             Privileged = new float[PrivDim];
-            return (new float[ObsDim], TerminalReward(), true);
+            return (TerminalReward(), true);
         }
 
-        return (Observe(), 0f, false);
+        Observe();
+        return (0f, false);
     }
 
     // Play random opponent moves until it's the learner's turn again or the game ends.
@@ -95,7 +97,7 @@ public sealed class HearthstoneEnv
         }
     }
 
-    private float[] Observe()
+    private void Observe()
     {
         _legal = _game.CurrentPlayer.Options();
         var feats = new float[_legal.Count][];
@@ -104,7 +106,7 @@ public sealed class HearthstoneEnv
             feats[i] = ActionEncoder.Encode(_legal[i], me);
         LegalActionFeatures = feats;
         Privileged = PrivilegedEncoder.Encode(_game.CurrentOpponent);
-        return FeatureExtractor.Extract(_observer.Observe(_game));
+        Tokens = TokenEncoder.Encode(_game);
     }
 
     private float TerminalReward()
