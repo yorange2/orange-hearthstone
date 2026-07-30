@@ -120,9 +120,14 @@ public sealed class HearthstoneEnv
     }
 
     /// <summary>Step by playing the current mover's greedy (MidRangeScore) heuristic action.</summary>
-    public bool StepGreedy()
+    public bool StepGreedy() => StepGreedy("midrange");
+
+    /// <summary>Step by playing the current mover's greedy action using the named strategy
+    /// (aggro, control, fatigue, ramp, midrange).</summary>
+    public bool StepGreedy(string strategyName)
     {
-        GreedyActionIndex = GreedyOpponent.BestAction(_game);
+        var s = GreedyOpponent.Parse(strategyName);
+        GreedyActionIndex = GreedyOpponent.BestAction(_game, s);
         return Step(GreedyActionIndex);
     }
 

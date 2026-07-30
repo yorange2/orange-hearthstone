@@ -29,12 +29,15 @@ while ((line = Console.In.ReadLine()) != null)
         env.Reset();
         Write(env, false);
     }
-    else if (line == "step_greedy")
+    else if (line.StartsWith("step_greedy"))
     {
-        bool done = env.StepGreedy();  // env plays the current mover's greedy heuristic action
+        // "step_greedy"         → midrange (default)
+        // "step_greedy aggro"   → AggroScore, etc.
+        string strategy = line.Length > 12 ? line[12..].Trim() : "midrange";
+        bool done = env.StepGreedy(strategy);
         Write(env, done);
     }
-    else if (line.StartsWith("step"))
+    else if (line.StartsWith("step "))
     {
         int idx = int.Parse(line.AsSpan(4).Trim());
         bool done = env.Step(idx);

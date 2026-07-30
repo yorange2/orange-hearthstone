@@ -84,9 +84,10 @@ class SabberEnv:
         d = self._rpc(f"step {idx}")
         return self._obs(d), bool(d["done"]), int(d["winner"])
 
-    def step_greedy(self) -> tuple["Obs", bool, int]:
-        """The env plays the current mover's greedy (MidRangeScore) heuristic action."""
-        d = self._rpc("step_greedy")
+    def step_greedy(self, strategy: str = "midrange") -> tuple["Obs", bool, int]:
+        """The env plays the current mover's greedy heuristic action.
+        strategy: one of midrange, aggro, control, fatigue, ramp."""
+        d = self._rpc(f"step_greedy {strategy}")
         return self._obs(d), bool(d["done"]), int(d["winner"])
 
     def close(self) -> None:

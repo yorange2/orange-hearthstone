@@ -148,22 +148,28 @@ def pad(seqs, dim):
     return torch.from_numpy(out), torch.from_numpy(mask)
 
 
+OPPONENT_STRATEGIES = ["midrange", "aggro", "control", "fatigue", "ramp"]
+
+
 @torch.no_grad()
 def evaluate(env, main, episodes, opponent="random"):
-    """Benchmark the recurrent main policy vs a fixed opponent. Returns win rate."""
+    """Benchmark the recurrent main policy vs a fixed opponent. Returns win rate.
+    opponent: "random", "greedy"/"midrange", or any of "aggro","control","fatigue","ramp"."""
     wins = 0
     for _ in range(episodes):
         obs = env.reset()
         seat = random.choice((1, 2))
-        mh, mc = main.initial_state()
+        hist, mask = main.initial_state()
         while True:
             if obs.player == seat:
-                i, _, _, mh, mc = act(main, obs, mh, mc)
+                i, _, _, hist, mask = act(main, obs, hist, mask)
                 obs, done, winner = env.step(i)
-            elif opponent == "greedy":
-                obs, done, winner = env.step_greedy()
-            else:
+            elif opponent == "random":
                 obs, done, winner = env.step(int(np.random.randint(obs.actions.shape[0])))
+            else:
+                # "greedy" / "midrange" / "aggro" / "control" / "fatigue" / "ramp"
+                strat = "midrange" if opponent == "greedy" else opponent
+                obs, done, winner = env.step_greedy(strat)
             if done:
                 wins += int(winner == seat)
                 break

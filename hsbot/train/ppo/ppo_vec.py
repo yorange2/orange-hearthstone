@@ -47,16 +47,20 @@ def _blank_traj():
     return {k: [] for k in ("tok", "prv", "act", "idx", "lp", "v", "r", "d", "hin", "cin", "phi")}
 
 
-def collect_vec(vec, main, greedy_prob, steps, gamma, shaping_coef):
+def collect_vec(vec, main, greedy_prob, steps, gamma, shaping_coef, strategies):
     """Parallel self-play + greedy rollout. Gathers >= `steps` main transitions across N envs,
-    keeping per-env trajectories so shaping/GAE are per-episode. Returns (batch, ep_returns)."""
+    keeping per-env trajectories so shaping/GAE are per-episode. Returns (batch, ep_returns).
+    `strategies` is a list of opponent strategy names sampled uniformly for greedy seats."""
     N = vec.n
     T = [_blank_traj() for _ in range(N)]
     ep_returns = []
 
     cur = vec.reset_all()
     main_seat = [random.choice((1, 2)) for _ in range(N)]
-    opp = ["greedy" if random.random() < greedy_prob else "self" for _ in range(N)]
+    opp = ["self"] * N
+    for i in range(N):
+        if random.random() < greedy_prob:
+            opp[i] = random.choice(strategies)  # e.g. "aggro", "midrange", etc.
     mh = [main.initial_state() for _ in range(N)]  # main-seat LSTM state per env
     oh = [main.initial_state() for _ in range(N)]  # self-opponent LSTM state per env
     last = [None] * N
@@ -67,7 +71,7 @@ def collect_vec(vec, main, greedy_prob, steps, gamma, shaping_coef):
         for i in range(N):
             if cur[i].player == main_seat[i]:
                 main_ids.append(i)
-            elif opp[i] == "greedy":
+            elif opp[i] != "self":
                 greedy_ids.append(i)
             else:
                 self_ids.append(i)
@@ -95,7 +99,7 @@ def collect_vec(vec, main, greedy_prob, steps, gamma, shaping_coef):
                 cmds[i] = f"step {idxs[k]}"
 
         for i in greedy_ids:
-            cmds[i] = "step_greedy"
+            cmds[i] = f"step_greedy {opp[i]}"
 
         res = vec.send_batch(cmds)
 
@@ -116,7 +120,7 @@ def collect_vec(vec, main, greedy_prob, steps, gamma, shaping_coef):
             for i in done_ids:
                 cur[i] = res2[i][0]
                 main_seat[i] = random.choice((1, 2))
-                opp[i] = "greedy" if random.random() < greedy_prob else "self"
+                opp[i] = random.choice(strategies) if random.random() < greedy_prob else "self"
                 mh[i] = main.initial_state(); oh[i] = main.initial_state()
                 last[i] = None
 
@@ -150,6 +154,7 @@ def cosine_lr(init_lr, decay_to, total_iters, current_iter):
 
 
 def train(args):
+    args.opponent_strategies = [s.strip() for s in args.opponent_strategies.split(",")]
     # Eval runs single-threaded on one env, so don't spawn the full training pool.
     n_envs = 1 if args.eval_only else args.num_envs
     vec = VecEnv(n_envs, seed0=args.seed, fixed_deck=args.fixed_deck, dll=args.dll, dotnet=args.dotnet)
@@ -190,7 +195,8 @@ def train(args):
             greedy_prob = args.greedy_prob
 
         t0 = time.time()
-        b, ep = collect_vec(vec, main, greedy_prob, args.steps, args.gamma, args.shaping_coef)
+        b, ep = collect_vec(vec, main, greedy_prob, args.steps, args.gamma, args.shaping_coef,
+                           args.opponent_strategies)
         sps = len(b["idx"]) / max(time.time() - t0, 1e-9)
 
         tok_t, tmask_t = pad(b["tok"], TOKEN_DIM)
@@ -276,6 +282,8 @@ def main():
                     help="curriculum: final greedy prob (set equal to --greedy-start to disable)")
     ap.add_argument("--curriculum-frac", type=float, default=0.5,
                     help="fraction of training over which greedy prob ramps (0.5 = first half)")
+    ap.add_argument("--opponent-strategies", type=str, default="midrange",
+                    help="comma-separated greedy opponent strategies (midrange,aggro,control,fatigue,ramp)")
     ap.add_argument("--fixed-deck", action="store_true")
     ap.add_argument("--eval-only", type=str, default=None,
                     help="evaluate a checkpoint and exit (no training)")
