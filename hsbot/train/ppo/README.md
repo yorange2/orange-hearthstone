@@ -1,43 +1,37 @@
 # ppo — reinforcement learning on SabberStone (prototype)
 
-A working **PPO** agent that learns Hearthstone by **self-play with an opponent league** in
-SabberStone. RL path "A": a **masked action-scoring policy** over the variable legal-action
-set, built on a **transformer entity-encoder + LSTM belief state**, driven through a simple
-stdio bridge to the C# engine.
+A **PPO** agent that learns Hearthstone in SabberStone by **imitation warm-start + self-play/
+greedy PPO**, and **outperforms the one-ply greedy heuristic** (~55% over 200 games). RL path
+"A": a **masked action-scoring policy** over the variable legal-action set, built on a
+**transformer entity-encoder + LSTM belief state**, driven through a simple stdio bridge to the
+C# engine.
 
-## Result — and an honest benchmark vs a heuristic
+## Result — beats the greedy heuristic
 
-25 iterations of self-play (prototype scale, a few minutes on CPU), evaluated against **two**
-fixed opponents: uniform-random (weak) and a **greedy heuristic** (SabberStone's own
-`MidRangeScore`, one-ply lookahead — the SabberStone analogue of Hearthstone-Script's `基础策略`):
+Evaluated against **two** fixed opponents: uniform-random (weak) and a **greedy heuristic**
+(SabberStone's own `MidRangeScore`, one-ply lookahead — the SabberStone analogue of
+Hearthstone-Script's `基础策略`). Over 200 eval games on the fixed Mage-mirror deck:
 
 ```
-iter  5   [vs random 0.60 | vs greedy 0.05]
-iter 15   [vs random 0.70 | vs greedy 0.10]
-iter 20   [vs random 0.63 | vs greedy 0.20]
-iter 25   [vs random 0.83 | vs greedy 0.05]
+vs random  1.000
+vs greedy  0.550   [95% CI 0.48–0.62]
 ```
 
-**The prototype beats random ~80% but loses ~85-95% to the greedy heuristic.** So: does it
-outperform `基础策略`-style play? **No — not at this scale.** "Beats random" is a near-useless
-signal; a competent one-ply greedy heuristic is a much higher bar this prototype doesn't clear.
+**The agent outperforms the one-ply greedy heuristic (~55%)** — the honest "do we beat a
+heuristic?" bar, not just "do we beat random?".
 
-**Training against the greedy agent (curriculum)** — the greedy heuristic is now a training
-opponent too (`--greedy-prob`, default 0.3), not just an eval. It helps: over 30 iters,
-vs-greedy rose from ~0.00-0.05 to **~0.15-0.20** (3-4×). But it still loses ~80-85%.
+**What got it there — imitation warm-start + PPO fine-tune.** PPO from scratch (even with the
+levers below) plateaus around ~40–47% vs greedy: a small model exploring from random weights
+rarely stumbles onto heuristic-level play. The breakthrough was a two-stage pipeline:
 
-**Sample-efficiency levers — reward shaping + fixed decks** (`--shaping-coef` 0.1,
-`--fixed-deck`). Potential-based shaping `F = coef*(γ·Φ' − Φ)` densifies the sparse ±1 reward
-with the board score (Φ = tanh(MidRangeScore/200), policy-invariant per Ng et al. 1999); fixed
-decks (Mage mirror + deterministic fill) slash variance. Effect over 30 iters: **vs-random
-jumped to ~0.93** (best yet), but **vs-greedy stayed ~0.10-0.15** — no breakthrough on the
-strong opponent.
+1. **Imitation pre-training** (`pretrain.py`): behavioral cloning on greedy-vs-greedy games
+   reaches ~85% top-1 action match — a policy that already ~39% matches greedy in-game.
+2. **PPO fine-tuning** (`ppo_vec.py --resume`) from that warm start climbs to ~55%.
 
-So every non-compute lever (curriculum, shaping, fixed decks) picks the low-hanging fruit
-(beats random handily) but **does not crack the greedy heuristic at ~25k samples**. The wall is
-genuinely **throughput** — the paper-level results needed millions-to-billions of frames, and a
-single CPU stdio env is orders of magnitude short. Next real lever = many parallel envs + GPU,
-not more tweaks or a bigger model.
+**Supporting levers** (all on by default in `ppo_vec.py`): a **greedy-prob curriculum**
+(`--greedy-start/--greedy-end` ramp), **reward shaping** (`--shaping-coef`; potential-based
+`F = coef*(γ·Φ' − Φ)`, Φ = tanh(MidRangeScore/200), policy-invariant per Ng et al. 1999),
+**fixed decks** (`--fixed-deck`, Mage mirror) for low variance, and LR/entropy schedules.
 
 ## Pieces
 
@@ -49,24 +43,27 @@ not more tweaks or a bigger model.
   critic-only). `GreedyOpponent` plays SabberStone's `MidRangeScore` one-ply for the benchmark.
   `Program.cs` stdio JSON server: `reset` / `step <idx>` / `step_greedy` →
   `{tokens[T,18], priv[8], actions[N,20], player, done, winner}`.
-- **`env.py`**: subprocess wrapper around that server.
-- **`env.py`**: subprocess wrapper (`Obs` = tokens/priv/actions/player).
-- **`ppo.py`**: `EntityEncoder` (a small **transformer** over the entity-token set,
-  permutation-invariant, masked mean-pool → per-state embedding) → **LSTM belief state**
-  (recurrent over the agent's decisions within a game) → `ActorCritic` (action scorer over
-  `concat(belief, action_feat)` + privileged value head); **self-play league**
-  (`collect` drives both seats — main policy stored, sampled opponent not; `snapshot`/
-  `sample_opp` manage the pool of past policies); GAE, clipped PPO, entropy bonus; `evaluate`
-  benchmarks vs random.
+- **`env.py`**: subprocess wrapper around that server (`Obs` = tokens/priv/actions/player/
+  potential/greedy_action; `VecEnv` drives N processes in lockstep).
+- **`ppo.py`**: the shared **model + utilities** (no training loop): `EntityEncoder` (a small
+  **transformer** over the entity-token set, permutation-invariant, masked mean-pool →
+  per-state embedding) → **LSTM belief state** (recurrent over the agent's decisions within a
+  game) → `ActorCritic` (action scorer over `concat(belief, action_feat)` + privileged value
+  head); plus `act`, `gae`, `pad`, and `evaluate` (benchmark vs random/greedy).
+- **`pretrain.py`**: imitation pre-training (behavioral cloning). Runs greedy-vs-greedy games,
+  records (state, greedy-action) pairs, and trains the policy by cross-entropy to imitate the
+  heuristic (~85% top-1). The resulting checkpoint is a strong warm start for PPO.
+- **`ppo_vec.py`**: the training loop — vectorized self-play + greedy PPO with LR/entropy
+  schedules, a greedy-prob curriculum, and best-checkpoint tracking. Also serves `--eval-only`.
 
-### Self-play league
+### Self-play + greedy (opponent scheme)
 
-Each game: the main policy takes a random seat; the opponent is the current policy (prob
-`--self-play-prob`) or a uniformly-sampled past **snapshot** from the league. Only the main
-seat's transitions train; the terminal ±1 reward is attached to that seat's last decision. The
-policy is snapshotted into the league every `--league-every` iters (capped at `--league-size`).
-This is the single-population core of league training — extend toward AlphaStar-style
-main/exploiter/main-exploiter populations for robustness.
+Each game the main policy takes a random seat; the opponent is either the **current policy**
+(self-play) or the **greedy heuristic**, chosen per game with probability `--greedy-prob` (or a
+curriculum that ramps `--greedy-start` → `--greedy-end`). Only the main seat's transitions
+train; the terminal ±1 reward is attached to that seat's last decision. Training against greedy
+directly (plus imitation warm-start) is what pushes the policy past the heuristic — extend
+toward an AlphaStar-style frozen-snapshot league for more robustness.
 
 ### Why a transformer entity-encoder (the "state = time series / sequence" idea)
 
@@ -91,16 +88,23 @@ Two distinct "transformer" opportunities exist; this implements the higher-lever
 ## Run
 
 ```
-# build the env once (use the .NET 8 SDK)
+# build the env once (targets net10.0)
 dotnet build hsbot/trainer/SabberStoneEnv -c Release
 
 cd hsbot/train/ppo
-python ppo.py --iters 50 --steps 2048            # dotnet must be on PATH
-# or point at a specific runtime:
-python ppo.py --dotnet /path/to/dotnet --dll ../../trainer/SabberStoneEnv/bin/Release/net8.0/SabberStoneEnv.dll
+# 1. imitation warm-start: clone the greedy heuristic (~85% action match)
+python pretrain.py --games 2000 --fixed-deck --out pretrained.pt
+
+# 2. PPO fine-tune from the warm start (beats greedy ~55%)
+python ppo_vec.py --resume pretrained.pt --fixed-deck --out ppo_policy.pt
+
+# 3. evaluate a checkpoint (no training)
+python ppo_vec.py --eval-only ppo_policy_best.pt --fixed-deck --num-envs 1
 ```
 
-Saves `ppo_policy.pt`.
+`ppo_vec.py` saves both the final `ppo_policy.pt` and the best-vs-greedy `ppo_policy_best.pt`.
+Pass `--dll`/`--dotnet` to point at a specific env build or runtime; otherwise `dotnet` must be
+on PATH and the default DLL path (`net10.0`) is used.
 
 ## Improvements from Xiao et al. 2023
 
@@ -143,24 +147,20 @@ python ppo_vec.py --num-envs 8 --iters 200 --steps 4096 --fixed-deck
 Measured on an 8-core laptop: **~447 → ~1500-1700 steps/s (~3.5-4×)**. It's not the full 8×
 because the greedy opponent's clone-heavy steps dominate wall time and the Python loop adds
 serial overhead; on a many-core + GPU box the batched inference pays off more and the gap
-widens. **This is the infrastructure for a real strength run** — beating the greedy heuristic
-needs that run (millions of frames on real hardware over hours-to-days), which is compute, not
-code. Nothing here reaches that on a laptop in a short session.
+widens. This throughput (plus the imitation warm-start) is what makes the ~55%-vs-greedy run
+finish in minutes on a laptop.
 
-## This is a prototype — upgrade paths
+## Upgrade paths
 
-- **League**: single-population self-play + **greedy heuristic as a training opponent** (both
-  done) → AlphaStar-style **main / exploiter / main-exploiter** populations + prioritized/
-  fictitious-play opponent sampling (OSFP).
-- **Throughput (the main blocker to beating greedy)**: single stdio env → **many parallel
-  envs** (`ppo_vec.py`, done — see below) → then a real many-core/GPU box for the real run.
-- **Reward**: terminal ±1 only → add **board-score shaping** for denser signal.
-- **Imperfect info / RNG**: currently handled implicitly via the observable features; add
-  **determinization / ISMCTS** for search-based strength (AlphaZero path "B").
-- **Throughput**: single env over stdio → **many parallel envs** (or SabberStone's gRPC
-  extension) for real sample scale; move the policy to GPU.
-- **Decks/cards**: random `FillDecks` → the **real deck** the live bot plays; restrict to a
-  well-supported card pool (SabberStone doesn't implement 100% of cards).
+- **Opponents**: self-play + greedy (done) → AlphaStar-style **main / exploiter /
+  main-exploiter** populations with a frozen-snapshot league + prioritized/fictitious-play
+  sampling (OSFP), for robustness beyond the single heuristic.
+- **Throughput**: many parallel stdio envs (`ppo_vec.py`, done) → SabberStone's gRPC extension
+  + a many-core/GPU box + a GPU-resident policy, for millions-of-frames strength runs.
+- **Imperfect info / RNG**: handled implicitly via observable features; add **determinization /
+  ISMCTS** for search-based strength (AlphaZero path "B").
+- **Decks/cards**: fixed Mage mirror / random `FillDecks` → the **real deck** the live bot
+  plays; restrict to a well-supported card pool (SabberStone doesn't implement 100% of cards).
 - **Deployment**: export the policy to **ONNX** and either serve it as the HS-Script MCTS
   `ScoreCalculator`/policy, or use the value head as the eval function. (The action-scoring
   ONNX + HS-Script action-mapping is more involved than the value-net export — a follow-up.)

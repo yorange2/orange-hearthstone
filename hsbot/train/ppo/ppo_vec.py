@@ -151,11 +151,20 @@ def cosine_lr(init_lr, decay_to, total_iters, current_iter):
 
 def train(args):
     vec = VecEnv(args.num_envs, seed0=args.seed, fixed_deck=args.fixed_deck, dll=args.dll, dotnet=args.dotnet)
-    main = ActorCritic(size=args.size)
-    if args.resume:
-        state = torch.load(args.resume, map_location="cpu", weights_only=True)
+    main = ActorCritic()
+    if args.resume or args.eval_only:
+        ckpt = args.resume or args.eval_only
+        state = torch.load(ckpt, map_location="cpu", weights_only=True)
         main.load_state_dict(state)
-        print(f"loaded pre-trained model from {args.resume}", flush=True)
+        print(f"loaded checkpoint from {ckpt}", flush=True)
+
+    if args.eval_only:
+        wr_r = evaluate(vec.envs[0], main, args.eval_episodes, "random")
+        wr_g = evaluate(vec.envs[0], main, args.eval_greedy_episodes, "greedy")
+        print(f"vs random {wr_r:.3f}  |  vs greedy {wr_g:.3f}")
+        vec.close()
+        return
+
     opt = torch.optim.Adam(main.parameters(), lr=args.lr)
 
     best_greedy_wr = -1.0
@@ -266,9 +275,8 @@ def main():
     ap.add_argument("--curriculum-frac", type=float, default=0.5,
                     help="fraction of training over which greedy prob ramps (0.5 = first half)")
     ap.add_argument("--fixed-deck", action="store_true")
-    ap.add_argument("--size", type=str, default="small",
-                    choices=["small", "medium", "large"],
-                    help="model capacity: small (138k), medium (~400k), large (~900k)")
+    ap.add_argument("--eval-only", type=str, default=None,
+                    help="evaluate a checkpoint and exit (no training)")
     ap.add_argument("--eval-every", type=int, default=5)
     ap.add_argument("--eval-episodes", type=int, default=50)
     ap.add_argument("--eval-greedy-episodes", type=int, default=50)

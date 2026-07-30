@@ -8,7 +8,7 @@ Phase 3 — save: the pre-trained model is a strong starting point for PPO fine-
     python pretrain.py --games 2000 --size medium --out pretrained_medium.pt
 """
 from __future__ import annotations
-import argparse, random, time
+import argparse, time
 
 import numpy as np
 import torch
