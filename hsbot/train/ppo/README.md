@@ -3,8 +3,8 @@
 A **PPO** agent that learns Hearthstone in SabberStone by **imitation warm-start + self-play/
 greedy PPO**, and **outperforms the one-ply greedy heuristic** (~55% over 200 games). RL path
 "A": a **masked action-scoring policy** over the variable legal-action set, built on a
-**transformer entity-encoder + LSTM belief state**, driven through a simple stdio bridge to the
-C# engine.
+**transformer entity-encoder + transformer belief state**, driven through a simple stdio bridge
+to the C# engine.
 
 ## Result — beats the greedy heuristic
 
@@ -47,9 +47,9 @@ rarely stumbles onto heuristic-level play. The breakthrough was a two-stage pipe
   potential/greedy_action; `VecEnv` drives N processes in lockstep).
 - **`ppo.py`**: the shared **model + utilities** (no training loop): `EntityEncoder` (a small
   **transformer** over the entity-token set, permutation-invariant, masked mean-pool →
-  per-state embedding) → **LSTM belief state** (recurrent over the agent's decisions within a
-  game) → `ActorCritic` (action scorer over `concat(belief, action_feat)` + privileged value
-  head); plus `act`, `gae`, `pad`, and `evaluate` (benchmark vs random/greedy).
+  per-state embedding) → `TemporalEncoder` (a **transformer over the last `MEM` decisions** →
+  belief state) → `ActorCritic` (action scorer over `concat(belief, action_feat)` + privileged
+  value head); plus `act`, `gae`, `pad`, and `evaluate` (benchmark vs random/greedy).
 - **`pretrain.py`**: imitation pre-training (behavioral cloning). Runs greedy-vs-greedy games,
   records (state, greedy-action) pairs, and trains the policy by cross-entropy to imitate the
   heuristic (~85% top-1). The resulting checkpoint is a strong warm start for PPO.
@@ -73,13 +73,15 @@ Two distinct "transformer" opportunities exist; this implements the higher-lever
   144-vector can't (cf. AlphaStar's entity encoder). Stateless per decision → deploys like the
   MLP. This is the "v2" state representation (tokens), separate from the flat `docs/FEATURES.md`
   contract (still used by the supervised value-net pipeline).
-- **Temporal LSTM belief state (done)** — an `nn.LSTMCell` carries a recurrent state across
-  the agent's decisions within a game, summarising history into a belief the heads condition
-  on (Hearthstone is a POMDP: hidden opponent hand/deck). LSTM, not transformer-over-time, for
-  a cheap per-step recurrent state in online RL (as in AlphaStar / OpenAI Five / Xiao et al.).
-  Recurrence uses R2D2 **stored-state** (each transition keeps its LSTM input state; the PPO
-  update recomputes one step from it, so minibatches stay per-transition — no BPTT through
-  time). At inference the plugin must carry the hidden state across the game's decisions.
+- **Temporal transformer belief state (done)** — `TemporalEncoder` self-attends over a fixed
+  window of the agent's last `MEM` per-decision embeddings and reads out the current slot as a
+  belief the heads condition on (Hearthstone is a POMDP: hidden opponent hand/deck). This
+  replaces an earlier `nn.LSTMCell` — attention over the window (cf. GTrXL / AlphaStar's memory)
+  learns cross-decision relations a single hidden vector can't; the tradeoff is bounded memory
+  (window `MEM`) vs the LSTM's unbounded-but-lossy state. Memory still uses R2D2 **stored-state**:
+  the recurrent state is the rolling window `(hist, mask)`, each transition keeps its input
+  window, and the PPO update recomputes one step from it — minibatches stay per-transition, no
+  BPTT through time. At inference the plugin must carry the window across the game's decisions.
 
 > Honesty note: at prototype scale (single env, ~20 iterations) the entity encoder is verified
 > to train stably and reach ~0.8 vs random — **on par with the MLP, not proven better**. The
@@ -135,7 +137,7 @@ shared card/hero embeddings; and a principled fictitious-play weighting (OSFP) o
 The single stdio env was the throughput bottleneck. `ppo_vec.py` runs **N env subprocesses in
 lockstep** (`VecEnv`): a batched command is written to all N stdins and flushed, so the N
 SabberStone processes step concurrently across cores while Python **batches policy inference**
-across them. Same agent (entity-transformer + LSTM + privileged critic + shaping); per-env
+across them. Same agent (entity-transformer + transformer belief state + privileged critic + shaping); per-env
 trajectories are kept separate so shaping/GAE stay per-episode-correct. Simplification: the
 opponent is self-play or greedy (the frozen-snapshot league is dropped so all inference batches
 through one net).

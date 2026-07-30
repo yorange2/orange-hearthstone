@@ -196,8 +196,8 @@ def train(args):
         tok_t, tmask_t = pad(b["tok"], TOKEN_DIM)
         act_t, amask_t = pad(b["act"], ACT_DIM)
         priv_t = torch.from_numpy(np.asarray(b["prv"], np.float32))
-        hin_t = torch.from_numpy(np.asarray(b["hin"], np.float32))
-        cin_t = torch.from_numpy(np.asarray(b["cin"], np.float32))
+        hist_t = torch.from_numpy(np.asarray(b["hin"], np.float32))   # belief window [n,MEM,d]
+        mask_t = torch.from_numpy(np.asarray(b["cin"], bool))         # window validity [n,MEM]
         idx_t = torch.tensor(b["idx"])
         oldlp_t = torch.tensor(b["lp"])
         adv = (b["adv"] - b["adv"].mean()) / (b["adv"].std() + 1e-8)
@@ -208,7 +208,7 @@ def train(args):
         pol_losses, val_losses, ents = [], [], []
         for _ in range(args.epochs):
             for mb in torch.randperm(n).split(args.minibatch):
-                logits, v, _, _ = main(tok_t[mb], tmask_t[mb], hin_t[mb], cin_t[mb],
+                logits, v, _, _ = main(tok_t[mb], tmask_t[mb], hist_t[mb], mask_t[mb],
                                        priv_t[mb], act_t[mb], amask_t[mb])
                 dist = torch.distributions.Categorical(logits=logits)
                 ratio = torch.exp(dist.log_prob(idx_t[mb]) - oldlp_t[mb])

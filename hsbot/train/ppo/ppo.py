@@ -32,60 +32,95 @@ class EntityEncoder(nn.Module):
         return (x * m).sum(1) / m.sum(1).clamp_min(1.0)       # masked mean pool
 
 
-class ActorCritic(nn.Module):
-    """Entity-transformer -> LSTM belief state -> action scorer + privileged value.
+MEM = 16  # temporal context window: how many of the agent's recent decisions the belief attends over
 
-    Hearthstone is a POMDP (hidden opponent hand/deck), so a single board snapshot is not a
-    sufficient statistic. The LSTM carries a recurrent state across the agent's decisions
-    within a game, summarising the history into a belief the heads condition on — the standard
-    recurrent core in AlphaStar / OpenAI Five / Xiao et al. (LSTM, not a transformer-over-time,
-    for a cheap per-step recurrent state in online RL).
 
-    Recurrence uses the R2D2 stored-state scheme: each transition keeps the LSTM input state,
-    so the PPO update recomputes one step from it and minibatches stay per-transition (no BPTT
-    through time). `forward` returns the next state too, for stepping during rollout.
+class TemporalEncoder(nn.Module):
+    """Transformer-over-time: attends over the rolling window of the agent's recent per-decision
+    state embeddings to produce a belief state. The belief is the encoded most-recent slot.
+
+    Learned positional embeddings are relative to *now* (slot -1 is the current decision, slot
+    -k is k decisions ago), so the encoding is meaningful regardless of absolute game turn.
+    Padding (early-game slots not yet filled) sits at the left and is masked out.
     """
 
-    def __init__(self, act_dim=ACT_DIM, priv_dim=PRIV_DIM, hid=128):
+    def __init__(self, d=64, mem=MEM, nhead=4, layers=2, ff=128):
         super().__init__()
-        d = 64   # entity-encoder embedding
-        hdim = 64  # LSTM hidden size
+        self.pos = nn.Parameter(torch.zeros(1, mem, d))
+        layer = nn.TransformerEncoderLayer(d, nhead, dim_feedforward=ff, batch_first=True)
+        self.tr = nn.TransformerEncoder(layer, num_layers=layers)
+
+    def forward(self, hist, mask):
+        """hist [B,K,d] (newest at slot -1); mask [B,K] bool (True = real). -> belief [B,d]."""
+        x = self.tr(hist + self.pos, src_key_padding_mask=~mask)
+        return x[:, -1, :]                                    # the current decision's slot = belief
+
+
+class ActorCritic(nn.Module):
+    """Entity-transformer -> transformer belief state -> action scorer + privileged value.
+
+    Hearthstone is a POMDP (hidden opponent hand/deck), so a single board snapshot is not a
+    sufficient statistic. A transformer-over-time (`TemporalEncoder`) carries history across the
+    agent's decisions within a game — it self-attends over a fixed window of the last `MEM`
+    per-decision embeddings and reads out the current slot as the belief the heads condition on.
+    This replaces the earlier LSTM recurrent core (cf. GTrXL / AlphaStar's attention memory);
+    attention over the window learns relations across decisions a single hidden vector can't.
+
+    Memory is carried with the R2D2 stored-state scheme: the recurrent "state" is a rolling
+    window `(hist, mask)` of past embeddings, and each transition keeps its INPUT window, so the
+    PPO update recomputes one step from it and minibatches stay per-transition (no BPTT through
+    time). `forward` appends the current embedding and returns the shifted next window too, for
+    stepping during rollout. Bounded memory (window `MEM`) is the tradeoff vs the LSTM's
+    unbounded-but-lossy state; recent board history dominates the belief in practice.
+    """
+
+    def __init__(self, act_dim=ACT_DIM, priv_dim=PRIV_DIM, hid=128, mem=MEM):
+        super().__init__()
+        d = 64   # entity-encoder embedding / belief dimension
+        self.mem = mem
+        self.d = d
 
         self.enc = EntityEncoder(d=d)
-        self.lstm = nn.LSTMCell(d, hdim)
-        self.scorer = nn.Sequential(nn.Linear(hdim + act_dim, hid), nn.ReLU(), nn.Linear(hid, 1))
-        self.value_enc = nn.Sequential(nn.Linear(hdim + priv_dim, hid), nn.ReLU(),
+        self.temporal = TemporalEncoder(d=d, mem=mem)
+        self.scorer = nn.Sequential(nn.Linear(d + act_dim, hid), nn.ReLU(), nn.Linear(hid, 1))
+        self.value_enc = nn.Sequential(nn.Linear(d + priv_dim, hid), nn.ReLU(),
                                         nn.Linear(hid, hid), nn.ReLU())
         self.value = nn.Linear(hid, 1)
-        self.hdim = hdim
 
     def initial_state(self, batch=1):
-        z = torch.zeros(batch, self.hdim)
-        return z, z.clone()
+        """Empty rolling window: (hist [B,MEM,d] zeros, mask [B,MEM] all-False)."""
+        hist = torch.zeros(batch, self.mem, self.d)
+        mask = torch.zeros(batch, self.mem, dtype=torch.bool)
+        return hist, mask
 
-    def forward(self, tokens, tmask, hin, cin, priv, actions, amask):
-        e = self.enc(tokens, tmask)                          # [B,d] per-state embedding
-        h, c = self.lstm(e, (hin, cin))                      # [B,H] belief state
+    def forward(self, tokens, tmask, hist_in, mask_in, priv, actions, amask):
+        e = self.enc(tokens, tmask)                          # [B,d] current per-state embedding
+        # shift the window left (drop oldest) and append the current embedding at slot -1
+        hist = torch.cat([hist_in[:, 1:, :], e.unsqueeze(1)], dim=1)          # [B,MEM,d]
+        ones = torch.ones(e.shape[0], 1, dtype=torch.bool, device=e.device)
+        mask = torch.cat([mask_in[:, 1:], ones], dim=1)                       # [B,MEM]
+        h = self.temporal(hist, mask)                        # [B,d] belief state
         _, n, _ = actions.shape
-        se = h.unsqueeze(1).expand(-1, n, -1)                # [B,N,H]
+        se = h.unsqueeze(1).expand(-1, n, -1)                # [B,N,d]
         logits = self.scorer(torch.cat([se, actions], dim=-1)).squeeze(-1)  # [B,N]
         logits = logits.masked_fill(~amask, -1e9)
         v = self.value(self.value_enc(torch.cat([h, priv], dim=-1))).squeeze(-1)  # [B] (privileged)
-        return logits, v, h, c
+        return logits, v, hist, mask
 
 
 @torch.no_grad()
-def act(policy, obs, hin, cin):
-    """One recurrent step. Returns (idx, logprob, value, h_out, c_out)."""
+def act(policy, obs, hist_in, mask_in):
+    """One recurrent step. `(hist_in, mask_in)` is the belief window before this decision.
+    Returns (idx, logprob, value, hist_out, mask_out) — the shifted window carries to the next step."""
     tk = torch.from_numpy(obs.tokens).unsqueeze(0)
     tm = torch.ones(1, obs.tokens.shape[0], dtype=torch.bool)
     p = torch.from_numpy(obs.priv).unsqueeze(0)
     a = torch.from_numpy(obs.actions).unsqueeze(0)
     am = torch.ones(1, obs.actions.shape[0], dtype=torch.bool)
-    logits, v, h, c = policy(tk, tm, hin, cin, p, a, am)
+    logits, v, hist, mask = policy(tk, tm, hist_in, mask_in, p, a, am)
     dist = torch.distributions.Categorical(logits=logits[0])
     idx = dist.sample()
-    return int(idx), float(dist.log_prob(idx)), float(v[0]), h, c
+    return int(idx), float(dist.log_prob(idx)), float(v[0]), hist, mask
 
 
 def gae(rewards, values, dones, last_v, gamma=1.0, lam=0.95):
