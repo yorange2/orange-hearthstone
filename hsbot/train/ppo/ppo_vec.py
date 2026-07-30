@@ -10,11 +10,13 @@ heuristic** — the frozen-snapshot league is dropped here so all policy inferen
 through one network (re-add per-env opponent nets later if wanted). Per-env trajectories are
 kept separate so reward shaping and GAE stay per-episode-correct despite interleaving.
 
-    python ppo_vec.py --num-envs 8 --iters 100 --steps 4096 --fixed-deck
+    python ppo_vec.py --num-envs 8 --iters 200 --steps 8192 --fixed-deck
 """
 from __future__ import annotations
 import argparse
+import math
 import random
+import time
 
 import numpy as np
 import torch
@@ -141,15 +143,43 @@ def collect_vec(vec, main, greedy_prob, steps, gamma, shaping_coef):
     return batch, ep_returns
 
 
+def cosine_lr(init_lr, decay_to, total_iters, current_iter):
+    """Cosine annealing: decays from init_lr to decay_to over total_iters."""
+    progress = min(current_iter / max(total_iters, 1), 1.0)
+    return decay_to + 0.5 * (init_lr - decay_to) * (1.0 + math.cos(math.pi * progress))
+
+
 def train(args):
     vec = VecEnv(args.num_envs, seed0=args.seed, fixed_deck=args.fixed_deck, dll=args.dll, dotnet=args.dotnet)
-    main = ActorCritic()
+    main = ActorCritic(size=args.size)
+    if args.resume:
+        state = torch.load(args.resume, map_location="cpu", weights_only=True)
+        main.load_state_dict(state)
+        print(f"loaded pre-trained model from {args.resume}", flush=True)
     opt = torch.optim.Adam(main.parameters(), lr=args.lr)
 
-    import time
+    best_greedy_wr = -1.0
+    best_path = args.out.replace(".pt", "_best.pt")
+
     for it in range(1, args.iters + 1):
+        # ---- LR schedule (cosine annealing) ----
+        current_lr = cosine_lr(args.lr, args.lr * args.lr_decay, args.iters, it)
+        for pg in opt.param_groups:
+            pg["lr"] = current_lr
+
+        # ---- Entropy schedule (linear decay) ----
+        progress = (it - 1) / max(args.iters - 1, 1)
+        ent_coef = args.ent_start + (args.ent_end - args.ent_start) * progress
+
+        # ---- Progressive curriculum: ramp greedy-prob over first part of training ----
+        if args.greedy_end > args.greedy_start:
+            curriculum_progress = min(progress / args.curriculum_frac, 1.0)
+            greedy_prob = args.greedy_start + (args.greedy_end - args.greedy_start) * curriculum_progress
+        else:
+            greedy_prob = args.greedy_prob
+
         t0 = time.time()
-        b, ep = collect_vec(vec, main, args.greedy_prob, args.steps, args.gamma, args.shaping_coef)
+        b, ep = collect_vec(vec, main, greedy_prob, args.steps, args.gamma, args.shaping_coef)
         sps = len(b["idx"]) / max(time.time() - t0, 1e-9)
 
         tok_t, tmask_t = pad(b["tok"], TOKEN_DIM)
@@ -164,6 +194,7 @@ def train(args):
         ret_t = torch.from_numpy(b["ret"])
 
         n = len(b["idx"])
+        pol_losses, val_losses, ents = [], [], []
         for _ in range(args.epochs):
             for mb in torch.randperm(n).split(args.minibatch):
                 logits, v, _, _ = main(tok_t[mb], tmask_t[mb], hin_t[mb], cin_t[mb],
@@ -175,47 +206,78 @@ def train(args):
                 pol_loss = -torch.min(surr1, surr2).mean()
                 val_loss = ((v - ret_t[mb]) ** 2).mean()
                 ent = dist.entropy().mean()
-                loss = pol_loss + args.vf * val_loss - args.ent * ent
+                loss = pol_loss + args.vf * val_loss - ent_coef * ent
                 opt.zero_grad(); loss.backward()
                 nn.utils.clip_grad_norm_(main.parameters(), 0.5); opt.step()
+                pol_losses.append(pol_loss.item())
+                val_losses.append(val_loss.item())
+                ents.append(ent.item())
 
         tr_wr = float(np.mean([r > 0 for r in ep])) if ep else float("nan")
+        avg_pol = float(np.mean(pol_losses))
+        avg_val = float(np.mean(val_losses))
+        avg_ent = float(np.mean(ents))
         line = (f"iter {it:3d}  envs {args.num_envs}  transitions {n:5d}  {sps:6.0f} steps/s  "
                 f"episodes {len(ep):3d}  train_wr {tr_wr:.3f}  "
-                f"pol {pol_loss.item():.3f}  val {val_loss.item():.3f}  ent {ent.item():.3f}")
+                f"lr {current_lr:.1e}  ent_coef {ent_coef:.4f}  "
+                f"pol {avg_pol:.3f}  val {avg_val:.3f}  ent {avg_ent:.3f}")
         if it % args.eval_every == 0:
             wr_r = evaluate(vec.envs[0], main, args.eval_episodes, "random")
             wr_g = evaluate(vec.envs[0], main, args.eval_greedy_episodes, "greedy")
             line += f"  [vs random {wr_r:.3f} | vs greedy {wr_g:.3f}]"
+            # Track best model by vs-greedy win rate
+            if wr_g > best_greedy_wr:
+                best_greedy_wr = wr_g
+                torch.save(main.state_dict(), best_path)
+                line += f"  *best*"
         print(line, flush=True)
 
     torch.save(main.state_dict(), args.out)
-    print(f"saved policy -> {args.out}")
+    print(f"saved final policy -> {args.out}")
+    if best_greedy_wr >= 0:
+        print(f"saved best policy (vs greedy {best_greedy_wr:.3f}) -> {best_path}")
     vec.close()
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--num-envs", type=int, default=8)
-    ap.add_argument("--iters", type=int, default=100)
-    ap.add_argument("--steps", type=int, default=4096, help="main transitions per iteration")
+    ap.add_argument("--iters", type=int, default=200)
+    ap.add_argument("--steps", type=int, default=8192, help="main transitions per iteration")
     ap.add_argument("--epochs", type=int, default=4)
     ap.add_argument("--minibatch", type=int, default=512)
     ap.add_argument("--lr", type=float, default=3e-4)
+    ap.add_argument("--lr-decay", type=float, default=0.1,
+                    help="cosine-anneal LR to lr*lr_decay over training")
     ap.add_argument("--gamma", type=float, default=1.0)
     ap.add_argument("--clip", type=float, default=0.2)
     ap.add_argument("--vf", type=float, default=0.5)
-    ap.add_argument("--ent", type=float, default=0.01)
-    ap.add_argument("--shaping-coef", type=float, default=0.1)
-    ap.add_argument("--greedy-prob", type=float, default=0.3)
+    ap.add_argument("--ent-start", type=float, default=0.02,
+                    help="entropy bonus at start (decays linearly to --ent-end)")
+    ap.add_argument("--ent-end", type=float, default=0.002,
+                    help="entropy bonus at end of training")
+    ap.add_argument("--shaping-coef", type=float, default=0.05)
+    ap.add_argument("--greedy-prob", type=float, default=0.7,
+                    help="prob. opponent is the greedy heuristic (constant; overridden by curriculum)")
+    ap.add_argument("--greedy-start", type=float, default=0.3,
+                    help="curriculum: initial greedy prob (ramps to --greedy-end)")
+    ap.add_argument("--greedy-end", type=float, default=0.7,
+                    help="curriculum: final greedy prob (set equal to --greedy-start to disable)")
+    ap.add_argument("--curriculum-frac", type=float, default=0.5,
+                    help="fraction of training over which greedy prob ramps (0.5 = first half)")
     ap.add_argument("--fixed-deck", action="store_true")
+    ap.add_argument("--size", type=str, default="small",
+                    choices=["small", "medium", "large"],
+                    help="model capacity: small (138k), medium (~400k), large (~900k)")
     ap.add_argument("--eval-every", type=int, default=5)
-    ap.add_argument("--eval-episodes", type=int, default=30)
-    ap.add_argument("--eval-greedy-episodes", type=int, default=20)
+    ap.add_argument("--eval-episodes", type=int, default=50)
+    ap.add_argument("--eval-greedy-episodes", type=int, default=50)
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--out", type=str, default="ppo_policy.pt")
     ap.add_argument("--dll", type=str, default=None)
     ap.add_argument("--dotnet", type=str, default="dotnet")
+    ap.add_argument("--resume", type=str, default=None,
+                    help="path to a pre-trained .pt checkpoint to fine-tune from")
     train(ap.parse_args())
 
 

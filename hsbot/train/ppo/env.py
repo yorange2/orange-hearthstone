@@ -30,10 +30,11 @@ class Obs:
     actions: np.ndarray  # [N, ACT_DIM]
     player: int          # 1 or 2 — whose turn it is
     potential: float     # normalized board score Φ ∈ [-1,1] (reward shaping)
+    greedy_action: int = -1  # action index chosen by greedy (only set after step_greedy)
 
 _DEFAULT_DLL = (
     pathlib.Path(__file__).resolve().parents[2]
-    / "trainer/SabberStoneEnv/bin/Release/net8.0/SabberStoneEnv.dll"
+    / "trainer/SabberStoneEnv/bin/Release/net10.0/SabberStoneEnv.dll"
 )
 
 
@@ -58,7 +59,8 @@ class SabberEnv:
     def _obs(self, d: dict) -> "Obs":
         return Obs(self._mat(d["tokens"], TOKEN_DIM), np.asarray(d["flat"], np.float32),
                    np.asarray(d["priv"], np.float32),
-                   self._mat(d["actions"], ACT_DIM), int(d["player"]), float(d["potential"]))
+                   self._mat(d["actions"], ACT_DIM), int(d["player"]), float(d["potential"]),
+                   int(d.get("greedyAction", -1)))
 
     # ---- low-level primitives (used by VecEnv to pipeline N processes) ----
     def send(self, cmd: str) -> None:

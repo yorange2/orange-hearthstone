@@ -65,17 +65,27 @@ class ActorCritic(nn.Module):
     through time). `forward` returns the next state too, for stepping during rollout.
     """
 
-    def __init__(self, act_dim=ACT_DIM, priv_dim=PRIV_DIM, hid=128):
+    def __init__(self, act_dim=ACT_DIM, priv_dim=PRIV_DIM, hid=128, size="small"):
         super().__init__()
-        self.enc = EntityEncoder()
-        d = self.enc.out_dim
-        self.lstm = nn.LSTMCell(d, H_DIM)
-        self.scorer = nn.Sequential(nn.Linear(H_DIM + act_dim, hid), nn.ReLU(), nn.Linear(hid, 1))
-        self.value_enc = nn.Sequential(nn.Linear(H_DIM + priv_dim, hid), nn.ReLU(), nn.Linear(hid, hid), nn.ReLU())
-        self.value = nn.Linear(hid, 1)
+        # size presets: "small" = original (138k), "medium" (~400k), "large" (~900k)
+        cfgs = {
+            "small":  dict(d=64,  nhead=4, layers=2, ff=128, hdim=64,  hid=128),
+            "medium": dict(d=96,  nhead=4, layers=3, ff=192, hdim=96,  hid=192),
+            "large":  dict(d=128, nhead=8, layers=4, ff=256, hdim=128, hid=256),
+        }
+        cfg = cfgs.get(size, cfgs["small"])
+        d, nhead, layers, ff, hdim, hid_val = cfg["d"], cfg["nhead"], cfg["layers"], cfg["ff"], cfg["hdim"], cfg["hid"]
+
+        self.enc = EntityEncoder(d=d, nhead=nhead, layers=layers, ff=ff)
+        self.lstm = nn.LSTMCell(d, hdim)
+        self.scorer = nn.Sequential(nn.Linear(hdim + act_dim, hid_val), nn.ReLU(), nn.Linear(hid_val, 1))
+        self.value_enc = nn.Sequential(nn.Linear(hdim + priv_dim, hid_val), nn.ReLU(),
+                                        nn.Linear(hid_val, hid_val), nn.ReLU())
+        self.value = nn.Linear(hid_val, 1)
+        self.hdim = hdim  # exposed for initial_state
 
     def initial_state(self, batch=1):
-        z = torch.zeros(batch, H_DIM)
+        z = torch.zeros(batch, self.hdim)
         return z, z.clone()
 
     def forward(self, tokens, tmask, hin, cin, priv, actions, amask):
