@@ -2,8 +2,9 @@
 
   <PropertyGroup>
     <OutputType>Exe</OutputType>
-    <!-- Multi-target: net8.0 for the CI parity tests (upstream SabberStone builds cleanly under
-         the .NET 8 SDK), net10.0 for local RL use (the runtime the user has installed). -->
+    <!-- Multi-target: net8.0 for the CI parity tests, net10.0 for local RL use (the runtime the
+         user has installed). Upstream SabberStone needs a Shuffle-overload patch to compile under
+         modern Roslyn regardless of TFM — CI reapplies it (see .github/workflows/ci.yml). -->
     <TargetFrameworks>net8.0;net10.0</TargetFrameworks>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>

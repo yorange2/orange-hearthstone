@@ -150,7 +150,9 @@ def cosine_lr(init_lr, decay_to, total_iters, current_iter):
 
 
 def train(args):
-    vec = VecEnv(args.num_envs, seed0=args.seed, fixed_deck=args.fixed_deck, dll=args.dll, dotnet=args.dotnet)
+    # Eval runs single-threaded on one env, so don't spawn the full training pool.
+    n_envs = 1 if args.eval_only else args.num_envs
+    vec = VecEnv(n_envs, seed0=args.seed, fixed_deck=args.fixed_deck, dll=args.dll, dotnet=args.dotnet)
     main = ActorCritic()
     if args.resume or args.eval_only:
         ckpt = args.resume or args.eval_only
