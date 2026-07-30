@@ -52,6 +52,7 @@ void Write(HearthstoneEnv e, bool done)
     {
         Tokens = e.Tokens, Flat = e.Flat, Priv = e.Privileged, Actions = e.LegalActionFeatures,
         Player = e.CurrentPlayerId, Potential = e.Potential, Done = done, Winner = e.Winner,
+        GreedyAction = e.GreedyActionIndex,
     };
     stdout.WriteLine(JsonSerializer.Serialize(resp, jsonOpts));
     stdout.Flush();
@@ -67,4 +68,5 @@ sealed class Response
     public float Potential { get; set; }
     public bool Done { get; set; }
     public int Winner { get; set; }
+    public int GreedyAction { get; set; }
 }

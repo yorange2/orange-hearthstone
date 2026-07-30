@@ -63,6 +63,9 @@ public sealed class HearthstoneEnv
     /// <summary>Winner PlayerId (1/2) once the game is over, else 0.</summary>
     public int Winner { get; private set; }
 
+    /// <summary>Action index chosen by the last StepGreedy() call (for imitation learning).</summary>
+    public int GreedyActionIndex { get; private set; }
+
     /// <summary>Normalized board-score potential Φ ∈ [-1,1] for the current mover (reward shaping).</summary>
     public float Potential { get; private set; }
 
@@ -117,7 +120,11 @@ public sealed class HearthstoneEnv
     }
 
     /// <summary>Step by playing the current mover's greedy (MidRangeScore) heuristic action.</summary>
-    public bool StepGreedy() => Step(GreedyOpponent.BestAction(_game));
+    public bool StepGreedy()
+    {
+        GreedyActionIndex = GreedyOpponent.BestAction(_game);
+        return Step(GreedyActionIndex);
+    }
 
     private void Observe()
     {
