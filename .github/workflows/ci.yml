@@ -30,9 +30,17 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-dotnet@v4
         with:
+          # Runs the net8.0 flavor of the (multi-targeted) SabberStoneGen + its tests.
           dotnet-version: "8.0.x"
       - name: clone SabberStone (vendor)
         run: git clone --depth 1 https://github.com/HearthSim/SabberStone.git vendor/SabberStone
+      - name: patch upstream SabberStone for modern Roslyn
+        # Two Shuffle() call sites in upstream fail overload resolution under the runner's SDK
+        # (first-class Span makes Card[] ambiguous between the IList<T> and Span<T> overloads).
+        # vendor/ is gitignored, so the same fix we keep locally is reapplied here.
+        run: |
+          perl -0777 -pi -e 's/IList<Card>(\s+playedCards\s*=.*?\.ToArray\(\))\s*\.Shuffle\((\w+)\.Random\);/Card[]$1;\n\t\t\t\tUtil.Shuffle<Card>(playedCards, $2.Random);/gs' \
+            vendor/SabberStone/SabberStoneCore/src/Tasks/SpecificTask.cs
       - name: dotnet test
         run: dotnet test hsbot/trainer/SabberStoneGen.Tests/SabberStoneGen.Tests.csproj -c Release
 

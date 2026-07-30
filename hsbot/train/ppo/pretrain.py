@@ -4,17 +4,16 @@ Phase 1 — generate data: greedy-vs-greedy self-play, recording (state, action)
 Phase 2 — pre-train: cross-entropy on greedy action choices.
 Phase 3 — save: the pre-trained model is a strong starting point for PPO fine-tuning.
 
-    python pretrain.py --games 2000 --out pretrained_small.pt
-    python pretrain.py --games 2000 --size medium --out pretrained_medium.pt
+    python pretrain.py --games 2000 --out pretrained.pt
 """
 from __future__ import annotations
-import argparse, random, time
+import argparse, time
 
 import numpy as np
 import torch
 import torch.nn as nn
 
-from env import SabberEnv, TOKEN_DIM, ACT_DIM
+from env import SabberEnv, TOKEN_DIM, ACT_DIM, PRIV_DIM
 from ppo import ActorCritic, pad
 
 
@@ -57,7 +56,7 @@ def pretrain(policy, data, epochs, batch_size, lr, device):
             tok, tmask = pad([b["tokens"] for b in batch], TOKEN_DIM)
             act, amask = pad([b["actions"] for b in batch], ACT_DIM)
             target = torch.tensor([b["idx"] for b in batch])
-            priv = torch.zeros(len(batch), 8, dtype=torch.float32)  # dummy priv (unused in policy)
+            priv = torch.zeros(len(batch), PRIV_DIM, dtype=torch.float32)  # dummy priv (policy logits ignore it)
             hin = torch.zeros(len(batch), policy.hdim)
             cin = torch.zeros(len(batch), policy.hdim)
 
@@ -92,7 +91,7 @@ def evaluate_imitation(policy, data):
         tok, tmask = pad([b["tokens"] for b in batch], TOKEN_DIM)
         act, amask = pad([b["actions"] for b in batch], ACT_DIM)
         target = np.array([b["idx"] for b in batch])
-        priv = torch.zeros(len(batch), 8)
+        priv = torch.zeros(len(batch), PRIV_DIM)
         hin = torch.zeros(len(batch), policy.hdim)
         cin = torch.zeros(len(batch), policy.hdim)
         logits, _, _, _ = policy(tok, tmask, hin, cin, priv, act, amask)
@@ -108,8 +107,6 @@ def main():
     ap.add_argument("--epochs", type=int, default=20)
     ap.add_argument("--batch-size", type=int, default=256)
     ap.add_argument("--lr", type=float, default=1e-3)
-    ap.add_argument("--size", type=str, default="small",
-                    choices=["small", "medium", "large"])
     ap.add_argument("--out", type=str, default="pretrained.pt")
     ap.add_argument("--fixed-deck", action="store_true")
     ap.add_argument("--seed", type=int, default=42)
@@ -131,9 +128,9 @@ def main():
 
     # Phase 2: pre-train
     print(f"\nPhase 2: behavioral cloning ({args.epochs} epochs)...", flush=True)
-    policy = ActorCritic(size=args.size)
+    policy = ActorCritic()
     params = sum(p.numel() for p in policy.parameters())
-    print(f"Model: {args.size} ({params:,} params)", flush=True)
+    print(f"Model: {params:,} params", flush=True)
     pretrain(policy, data, args.epochs, args.batch_size, args.lr, device="cpu")
 
     # Phase 3: save
