@@ -1,24 +1,44 @@
 using SabberStoneCore.Model;
 using SabberStoneCore.Model.Entities;
+using SabberStoneBasicAI.Score;
 
 namespace SabberStoneEnv;
 
 /// <summary>
-/// A greedy heuristic opponent built from SabberStone's OWN baseline scoring
-/// (<c>SabberStoneBasicAI.Score.MidRangeScore</c>): one-ply lookahead — for each legal option,
-/// clone the game, apply it, and rate the acting player's resulting board; pick the best.
-///
-/// This is a hand-tuned-heuristic benchmark — the SabberStone-side analogue of Hearthstone-
-/// Script's `基础策略` (also a greedy weighted heuristic). Evaluating our RL policy against it
-/// gives an honest "do we beat a heuristic?" number instead of "do we beat random?".
+/// Greedy heuristic opponent with selectable strategy. All five SabberStone
+/// one-ply lookahead scoring heuristics are exposed: the same clone-process-rate
+/// loop, different board-state evaluators.
 /// </summary>
 public static class GreedyOpponent
 {
-    private static readonly SabberStoneBasicAI.Score.Score Scorer = new SabberStoneBasicAI.Score.MidRangeScore();
+    /// <summary>Strategy enum matching the protocol command ("midrange", "aggro", etc.).</summary>
+    public enum Strategy { Midrange, Aggro, Control, Fatigue, Ramp }
 
-    /// <summary>Index (into the current player's Options()) of the greedy-best action.</summary>
-    public static int BestAction(Game game)
+    /// <summary>Scorer factory.</summary>
+    public static Score ScorerFor(Strategy s) => s switch
     {
+        Strategy.Aggro    => new AggroScore(),
+        Strategy.Control  => new ControlScore(),
+        Strategy.Fatigue  => new FatigueScore(),
+        Strategy.Ramp     => new RampScore(),
+        _                 => new MidRangeScore(),
+    };
+
+    /// <summary>Parse a strategy name (case-insensitive). Returns Midrange on unknown input.</summary>
+    public static Strategy Parse(string name) => name.ToLowerInvariant() switch
+    {
+        "aggro"    => Strategy.Aggro,
+        "control"  => Strategy.Control,
+        "fatigue"  => Strategy.Fatigue,
+        "ramp"     => Strategy.Ramp,
+        _          => Strategy.Midrange,
+    };
+
+    /// <summary>Index (into the current player's Options()) of the greedy-best action for the given
+    /// strategy.  One-ply lookahead: clone → process each option → rate acting player's board.</summary>
+    public static int BestAction(Game game, Strategy strategy = Strategy.Midrange)
+    {
+        var scorer = ScorerFor(strategy);
         int actingPid = game.CurrentPlayer.PlayerId;
         int n = game.CurrentPlayer.Options().Count;
         int bestIdx = 0, bestRate = int.MinValue;
@@ -31,8 +51,8 @@ public static class GreedyOpponent
             Controller c = clone.CurrentPlayer.PlayerId == actingPid
                 ? clone.CurrentPlayer
                 : clone.CurrentPlayer.Opponent;
-            Scorer.Controller = c;
-            int rate = Scorer.Rate();
+            scorer.Controller = c;
+            int rate = scorer.Rate();
             if (rate > bestRate) { bestRate = rate; bestIdx = i; }
         }
         return bestIdx;
