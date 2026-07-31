@@ -84,6 +84,7 @@ class ActorCritic(nn.Module):
             "small":  dict(d=64,  nhead=4, layers=2, ff=128, hid=128),
             "medium": dict(d=96,  nhead=4, layers=3, ff=192, hid=192),
             "large":  dict(d=128, nhead=8, layers=4, ff=256, hid=256),
+            "xl":     dict(d=128, nhead=8, layers=5, ff=320, hid=320),
         }
         cfg = cfgs.get(size, cfgs["small"])
         d = cfg["d"]; nhead = cfg["nhead"]; layers = cfg["layers"]; ff = cfg["ff"]; hid = cfg["hid"]

@@ -106,7 +106,7 @@ def main():
     ap.add_argument("--batch-size", type=int, default=256)
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--size", type=str, default="small",
-                    choices=["small", "medium", "large"])
+                    choices=["small", "medium", "large", "xl"])
     ap.add_argument("--out", type=str, default="pretrained.pt")
     ap.add_argument("--fixed-deck", action="store_true")
     ap.add_argument("--seed", type=int, default=42)
