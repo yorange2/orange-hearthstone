@@ -158,7 +158,7 @@ def train(args):
     # Eval runs single-threaded on one env, so don't spawn the full training pool.
     n_envs = 1 if args.eval_only else args.num_envs
     vec = VecEnv(n_envs, seed0=args.seed, fixed_deck=args.fixed_deck, dll=args.dll, dotnet=args.dotnet)
-    main = ActorCritic()
+    main = ActorCritic(size=args.size)
     if args.resume or args.eval_only:
         ckpt = args.resume or args.eval_only
         state = torch.load(ckpt, map_location="cpu", weights_only=True)
@@ -284,6 +284,9 @@ def main():
                     help="fraction of training over which greedy prob ramps (0.5 = first half)")
     ap.add_argument("--opponent-strategies", type=str, default="midrange",
                     help="comma-separated greedy opponent strategies (midrange,aggro,control,fatigue,ramp)")
+    ap.add_argument("--size", type=str, default="small",
+                    choices=["small", "medium", "large"],
+                    help="model scale: small (173k), medium (~500k), large (~900k)")
     ap.add_argument("--fixed-deck", action="store_true")
     ap.add_argument("--eval-only", type=str, default=None,
                     help="evaluate a checkpoint and exit (no training)")

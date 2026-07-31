@@ -105,6 +105,8 @@ def main():
     ap.add_argument("--epochs", type=int, default=20)
     ap.add_argument("--batch-size", type=int, default=256)
     ap.add_argument("--lr", type=float, default=1e-3)
+    ap.add_argument("--size", type=str, default="small",
+                    choices=["small", "medium", "large"])
     ap.add_argument("--out", type=str, default="pretrained.pt")
     ap.add_argument("--fixed-deck", action="store_true")
     ap.add_argument("--seed", type=int, default=42)
@@ -126,9 +128,9 @@ def main():
 
     # Phase 2: pre-train
     print(f"\nPhase 2: behavioral cloning ({args.epochs} epochs)...", flush=True)
-    policy = ActorCritic()
+    policy = ActorCritic(size=args.size)
     params = sum(p.numel() for p in policy.parameters())
-    print(f"Model: {params:,} params", flush=True)
+    print(f"Model: {args.size} ({params:,} params)", flush=True)
     pretrain(policy, data, args.epochs, args.batch_size, args.lr, device="cpu")
 
     # Phase 3: save
