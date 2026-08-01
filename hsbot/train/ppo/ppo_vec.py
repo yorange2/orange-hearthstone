@@ -204,9 +204,8 @@ def train(args):
     # Vocab comes from the env, not a constant: the embedding must match the indices the env
     # actually emits, and a checkpoint is only loadable into a model built with the same vocab.
     card_vocab, card_text = card_text_mod.resolve(args.card_text, eval_env.card_vocab(),
-                                                  args.no_card_emb, eval_env.card_ids_hash())
-    main = ActorCritic(size=args.size, card_vocab=card_vocab, card_dim=args.card_dim,
-                       card_text=card_text).to(device)
+                                                  eval_env.card_ids_hash())
+    main = ActorCritic(size=args.size, card_dim=args.card_dim, card_text=card_text).to(device)
     total = sum(p.numel() for p in main.parameters())
     trainable = sum(p.numel() for p in main.parameters() if p.requires_grad)
     print(card_text_mod.describe(card_vocab, card_text, args.card_dim), flush=True)
@@ -214,6 +213,15 @@ def train(args):
     if args.resume or args.eval_only:
         ckpt = args.resume or args.eval_only
         state = torch.load(ckpt, map_location="cpu", weights_only=True)
+        # Checkpoints predating the card-text-only model have no card_text/card_proj tensors and a
+        # narrower enc.embed. Say so plainly: the raw state_dict error names six tensors and not
+        # the cause.
+        if "enc.card_text.weight" not in state:
+            raise SystemExit(
+                f"{ckpt} is a pre-card-text checkpoint (card-blind or learned-id). Those model "
+                f"paths were removed, so it cannot be loaded by this code. Retrain with "
+                f"card-text embeddings, or check out a commit before the removal to score it."
+            )
         main.load_state_dict(state)
         print(f"loaded checkpoint from {ckpt}", flush=True)
 
@@ -374,8 +382,8 @@ def main():
     ap.add_argument("--deck", type=str, default=None, choices=DECK_MODES,
                     help="fixed (Mage mirror) | variedmirror (random deck, same both seats) | random")
     ap.add_argument("--card-text", type=str, default=None,
-                    help="path to a card_text.py .npz; uses frozen card-text embeddings "
-                         "instead of the learned id embedding")
+                    help="path to a card_text.py .npz (default: card_text_emb.npz beside this "
+                         "script); card text is the only card-identity path")
     ap.add_argument("--eval-only", type=str, default=None,
                     help="evaluate a checkpoint and exit (no training)")
     ap.add_argument("--eval-every", type=int, default=10)
@@ -388,10 +396,7 @@ def main():
                     help="seed for the dedicated eval env + eval RNG; must not overlap the "
                          "training seeds (--seed .. --seed+--num-envs-1) or eval is not held out")
     ap.add_argument("--card-dim", type=int, default=16,
-                    help="card-identity embedding width (Phase 1)")
-    ap.add_argument("--no-card-emb", action="store_true",
-                    help="ablation: disable the card embedding, restoring the card-blind "
-                         "18-float-only observation")
+                    help="width the frozen card-text vectors are projected to")
     ap.add_argument("--lookahead", action="store_true",
                     help="Phase 3: evaluate with critic-scored one-ply lookahead, matching the "
                          "search depth greedy already has. Costs N engine clones per decision")

@@ -19,48 +19,43 @@ class EntityEncoder(nn.Module):
     No positional encoding: entities are a set, so the encoder is permutation-invariant."""
 
     def __init__(self, token_dim=TOKEN_DIM, d=64, nhead=4, layers=2, ff=128,
-                 card_vocab=0, card_dim=16, card_text=None):
+                 card_dim=16, card_text=None):
         super().__init__()
         # Card identity is categorical, so it enters as an embedding rather than a float feature.
         # Without it the 18-float token carries no card semantics at all: two different 4-cost
-        # spells are byte-identical inputs, which caps achievable play below the greedy heuristic
-        # (greedy scores through the real simulator and implicitly knows every card's effect).
+        # spells are byte-identical inputs.
         #
-        # Two ways to supply that identity:
-        #  - `card_vocab` — a learned lookup per card. Only cards that actually appear in training
-        #    ever get a gradient (471 of 8303 under --fixed-deck), so every other card reads as a
-        #    random vector, and it reads as one *silently*.
-        #  - `card_text` — a frozen [vocab, D] matrix of card-text embeddings (see card_text.py),
-        #    projected to `card_dim` by a small trained layer. Meaning comes from the text, so all
-        #    8303 rows are populated before a single game is played and an unseen card is
-        #    represented by its similarity to seen ones. Trainable params are just the projection
-        #    (D x card_dim), which is *fewer* than the lookup table's, so this adds information
-        #    without adding capacity — keeping it clear of the capacity confound.
-        self.card_text = None
-        if card_text is not None:
-            # Frozen: these vectors are the input data, not parameters. Fine-tuning them would
-            # re-introduce exactly the problem being solved, since only seen rows would move.
-            self.card_text = nn.Embedding.from_pretrained(card_text, freeze=True, padding_idx=0)
-            self.card_proj = nn.Linear(card_text.shape[1], card_dim)
-            self.card_emb = None
-        else:
-            self.card_emb = nn.Embedding(card_vocab, card_dim, padding_idx=0) if card_vocab else None
+        # `card_text` is a frozen [vocab, D] matrix of card-text embeddings (see card_text.py),
+        # projected to `card_dim` by a small trained layer. Meaning comes from the text, so all
+        # 8303 rows are populated before a single game is played and a card that never appeared in
+        # training is represented by its similarity to ones that did. Trainable cost is just the
+        # projection (D x card_dim).
+        #
+        # The two alternatives this used to support — a learned per-card `nn.Embedding`, and a
+        # card-blind mode — were removed. Neither beat the other in-distribution (all three arms
+        # landed at ~0.49-0.50 over 7200 games), and both are undefined on an unseen card: blind
+        # has no card signal at all, and the learned table returns a random-init row *silently*,
+        # which is worse than no signal because it is indistinguishable from data.
+        if card_text is None:
+            raise ValueError(
+                "EntityEncoder requires card_text. The learned-id and card-blind paths were "
+                "removed; build the matrix with `python card_text.py --out card_text_emb.npz`."
+            )
+        # Frozen: these vectors are the input data, not parameters. Fine-tuning them would
+        # re-introduce exactly the problem being solved, since only seen rows would move.
+        self.card_text = nn.Embedding.from_pretrained(card_text, freeze=True, padding_idx=0)
+        self.card_proj = nn.Linear(card_text.shape[1], card_dim)
 
-        uses_card = self.card_emb is not None or self.card_text is not None
-        in_dim = token_dim + (card_dim if uses_card else 0)
-        self.embed = nn.Linear(in_dim, d)
+        self.embed = nn.Linear(token_dim + card_dim, d)
         layer = nn.TransformerEncoderLayer(d, nhead, dim_feedforward=ff, batch_first=True)
         self.tr = nn.TransformerEncoder(layer, num_layers=layers)
         self.out_dim = d
 
     def forward(self, tokens, tmask, card_ids=None):
         """tokens [B,T,token_dim]; tmask [B,T] bool (True = real); card_ids [B,T] int64. -> [B,d]."""
-        if self.card_emb is not None or self.card_text is not None:
-            if card_ids is None:
-                card_ids = torch.zeros(tokens.shape[:2], dtype=torch.long, device=tokens.device)
-            feat = (self.card_proj(self.card_text(card_ids)) if self.card_text is not None
-                    else self.card_emb(card_ids))
-            tokens = torch.cat([tokens, feat], dim=-1)
+        if card_ids is None:
+            card_ids = torch.zeros(tokens.shape[:2], dtype=torch.long, device=tokens.device)
+        tokens = torch.cat([tokens, self.card_proj(self.card_text(card_ids))], dim=-1)
         x = self.embed(tokens)
         x = self.tr(x, src_key_padding_mask=~tmask)          # ignore padded tokens
         m = tmask.float().unsqueeze(-1)                       # [B,T,1]
@@ -110,7 +105,7 @@ class ActorCritic(nn.Module):
     """
 
     def __init__(self, act_dim=ACT_DIM, priv_dim=PRIV_DIM, hid=128, mem=MEM, size="small",
-                 card_vocab=0, card_dim=16, card_text=None):
+                 card_dim=16, card_text=None):
         super().__init__()
         # Presets scale entity-encoder + temporal-encoder dimensions together.
         # small  (173k) — original, for quick iteration
@@ -131,7 +126,7 @@ class ActorCritic(nn.Module):
         self.d = d
 
         self.enc = EntityEncoder(d=d, nhead=nhead, layers=layers, ff=ff,
-                                 card_vocab=card_vocab, card_dim=card_dim, card_text=card_text)
+                                 card_dim=card_dim, card_text=card_text)
         self.temporal = TemporalEncoder(d=d, mem=mem, nhead=nhead, layers=layers, ff=ff)
         self.scorer = nn.Sequential(nn.Linear(d + act_dim, hid), nn.ReLU(), nn.Linear(hid, 1))
         self.value_enc = nn.Sequential(nn.Linear(d + priv_dim, hid), nn.ReLU(),

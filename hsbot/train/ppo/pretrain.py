@@ -117,17 +117,15 @@ def main():
     ap.add_argument("--device", type=str, default="auto", choices=DEVICE_CHOICES,
                     help="compute device (auto = cuda > mps > cpu)")
     ap.add_argument("--card-dim", type=int, default=16,
-                    help="card-identity embedding width (Phase 1)")
-    ap.add_argument("--no-card-emb", action="store_true",
-                    help="ablation: disable the card embedding (card-blind observation)")
+                    help="width the frozen card-text vectors are projected to")
     ap.add_argument("--out", type=str, default="pretrained.pt")
     ap.add_argument("--fixed-deck", action="store_true",
                     help="shorthand for --deck fixed")
     ap.add_argument("--deck", type=str, default=None, choices=DECK_MODES,
                     help="fixed (Mage mirror) | variedmirror (random deck, same both seats) | random")
     ap.add_argument("--card-text", type=str, default=None,
-                    help="path to a card_text.py .npz; uses frozen card-text embeddings "
-                         "instead of the learned id embedding")
+                    help="path to a card_text.py .npz (default: card_text_emb.npz beside this "
+                         "script); card text is the only card-identity path")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--dll", type=str, default=None)
     ap.add_argument("--dotnet", type=str, default="dotnet")
@@ -152,9 +150,8 @@ def main():
 
     # Phase 2: pre-train
     print(f"\nPhase 2: behavioral cloning ({args.epochs} epochs, device={device})...", flush=True)
-    card_vocab, card_text = card_text_mod.resolve(args.card_text, env_vocab, args.no_card_emb, env_ids_hash)
-    policy = ActorCritic(size=args.size, card_vocab=card_vocab, card_dim=args.card_dim,
-                         card_text=card_text).to(device)
+    card_vocab, card_text = card_text_mod.resolve(args.card_text, env_vocab, env_ids_hash)
+    policy = ActorCritic(size=args.size, card_dim=args.card_dim, card_text=card_text).to(device)
     params = sum(p.numel() for p in policy.parameters())
     trainable = sum(p.numel() for p in policy.parameters() if p.requires_grad)
     print(f"Model: {args.size} ({params:,} params, {trainable:,} trainable)", flush=True)

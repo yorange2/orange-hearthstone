@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import pathlib
 import re
 
 import numpy as np
@@ -163,27 +164,36 @@ def load(path: str, expect_vocab: int | None = None, expect_ids_hash: str | None
     return emb
 
 
-def resolve(path: str | None, env_vocab: int, no_card_emb: bool, env_ids_hash: str | None = None):
-    """Decide the card-identity mode for an entry point. Returns (card_vocab, card_text_tensor).
+DEFAULT_PATH = str(pathlib.Path(__file__).resolve().parent / "card_text_emb.npz")
+
+
+def resolve(path: str | None, env_vocab: int, env_ids_hash: str | None = None):
+    """Load the card-text matrix for an entry point. Returns (vocab, card_text_tensor).
 
     Shared by pretrain.py and ppo_vec.py so the two cannot disagree about what a given set of
     flags means — a mismatch there produces checkpoints that silently fail to load, or worse,
     load into a differently-wired model.
+
+    Card text is now the only card-identity path (the learned-id and card-blind modes were
+    removed), so a missing matrix is a hard error with the command to build it rather than a
+    quiet degradation to a card-blind model.
     """
     import torch
 
-    if path:
-        emb = load(path, expect_vocab=env_vocab, expect_ids_hash=env_ids_hash)
-        return env_vocab, torch.from_numpy(emb)
-    return (0 if no_card_emb else env_vocab), None
+    path = path or DEFAULT_PATH
+    if not pathlib.Path(path).exists():
+        raise SystemExit(
+            f"card-text embedding not found at {path}.\n"
+            f"It is a generated artifact (gitignored). Build it once with:\n"
+            f"    python card_text.py --out {DEFAULT_PATH}"
+        )
+    emb = load(path, expect_vocab=env_vocab, expect_ids_hash=env_ids_hash)
+    return env_vocab, torch.from_numpy(emb)
 
 
 def describe(card_vocab: int, card_text, card_dim: int) -> str:
-    if card_text is not None:
-        return f"card identity: text embedding (vocab={card_vocab}, {card_text.shape[1]}d -> {card_dim}, frozen)"
-    if card_vocab:
-        return f"card identity: learned id embedding (vocab={card_vocab}, dim={card_dim})"
-    return "card identity: none (card-blind)"
+    return (f"card identity: text embedding "
+            f"(vocab={card_vocab}, {card_text.shape[1]}d -> {card_dim}, frozen)")
 
 
 def main() -> None:
