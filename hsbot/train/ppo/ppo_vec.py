@@ -27,7 +27,7 @@ from ppo import ActorCritic, gae, pad, evaluate
 
 
 @torch.no_grad()
-def batched_act(policy, obs_list, hc_list):
+def batched_act(policy, obs_list, hc_list, device="cpu"):
     """Batched recurrent step over a list of decision points. Returns (idxs, logprobs, values,
     new_states) with one entry per input."""
     tok, tmask = pad([o.tokens for o in obs_list], TOKEN_DIM)
@@ -35,11 +35,12 @@ def batched_act(policy, obs_list, hc_list):
     priv = torch.from_numpy(np.asarray([o.priv for o in obs_list], np.float32))
     hin = torch.cat([hc[0] for hc in hc_list], 0)
     cin = torch.cat([hc[1] for hc in hc_list], 0)
-    logits, v, h, c = policy(tok, tmask, hin, cin, priv, act_t, amask)
+    logits, v, h, c = policy(tok.to(device), tmask.to(device), hin.to(device), cin.to(device),
+                              priv.to(device), act_t.to(device), amask.to(device))
     dist = torch.distributions.Categorical(logits=logits)
     idx = dist.sample()
     lp = dist.log_prob(idx)
-    new_hc = [(h[i:i + 1], c[i:i + 1]) for i in range(len(obs_list))]
+    new_hc = [(h[i:i + 1].cpu(), c[i:i + 1].cpu()) for i in range(len(obs_list))]
     return idx.tolist(), lp.tolist(), v.tolist(), new_hc
 
 
@@ -47,7 +48,7 @@ def _blank_traj():
     return {k: [] for k in ("tok", "prv", "act", "idx", "lp", "v", "r", "d", "hin", "cin", "phi")}
 
 
-def collect_vec(vec, main, greedy_prob, steps, gamma, shaping_coef, strategies):
+def collect_vec(vec, main, greedy_prob, steps, gamma, shaping_coef, strategies, device="cpu"):
     """Parallel self-play + greedy rollout. Gathers >= `steps` main transitions across N envs,
     keeping per-env trajectories so shaping/GAE are per-episode. Returns (batch, ep_returns).
     `strategies` is a list of opponent strategy names sampled uniformly for greedy seats."""
@@ -79,7 +80,7 @@ def collect_vec(vec, main, greedy_prob, steps, gamma, shaping_coef, strategies):
         cmds: list[str | None] = [None] * N
 
         if main_ids:
-            idxs, lps, vs, nhc = batched_act(main, [cur[i] for i in main_ids], [mh[i] for i in main_ids])
+            idxs, lps, vs, nhc = batched_act(main, [cur[i] for i in main_ids], [mh[i] for i in main_ids], device)
             for k, i in enumerate(main_ids):
                 t = T[i]
                 t["tok"].append(cur[i].tokens); t["prv"].append(cur[i].priv); t["act"].append(cur[i].actions)
@@ -93,7 +94,7 @@ def collect_vec(vec, main, greedy_prob, steps, gamma, shaping_coef, strategies):
                 total += 1
 
         if self_ids:
-            idxs, _, _, nhc = batched_act(main, [cur[i] for i in self_ids], [oh[i] for i in self_ids])
+            idxs, _, _, nhc = batched_act(main, [cur[i] for i in self_ids], [oh[i] for i in self_ids], device)
             for k, i in enumerate(self_ids):
                 oh[i] = nhc[k]
                 cmds[i] = f"step {idxs[k]}"
@@ -155,10 +156,21 @@ def cosine_lr(init_lr, decay_to, total_iters, current_iter):
 
 def train(args):
     args.opponent_strategies = [s.strip() for s in args.opponent_strategies.split(",")]
+    # Device selection: default to CPU. MPS is available but ~10× slower for this model
+    # (transformer nested-tensor ops aren't MPS-native; fallback adds transfer overhead).
+    if args.device == "auto":
+        device = "cpu"
+    else:
+        device = args.device
+    if device == "mps":
+        import os; os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+        print("note: MPS is ~10× slower than CPU for this transformer model", flush=True)
+    print(f"device: {device}", flush=True)
+
     # Eval runs single-threaded on one env, so don't spawn the full training pool.
     n_envs = 1 if args.eval_only else args.num_envs
     vec = VecEnv(n_envs, seed0=args.seed, fixed_deck=args.fixed_deck, dll=args.dll, dotnet=args.dotnet)
-    main = ActorCritic(size=args.size)
+    main = ActorCritic(size=args.size).to(device)
     if args.resume or args.eval_only:
         ckpt = args.resume or args.eval_only
         state = torch.load(ckpt, map_location="cpu", weights_only=True)
@@ -196,19 +208,19 @@ def train(args):
 
         t0 = time.time()
         b, ep = collect_vec(vec, main, greedy_prob, args.steps, args.gamma, args.shaping_coef,
-                           args.opponent_strategies)
+                           args.opponent_strategies, device)
         sps = len(b["idx"]) / max(time.time() - t0, 1e-9)
 
-        tok_t, tmask_t = pad(b["tok"], TOKEN_DIM)
-        act_t, amask_t = pad(b["act"], ACT_DIM)
-        priv_t = torch.from_numpy(np.asarray(b["prv"], np.float32))
-        hist_t = torch.from_numpy(np.asarray(b["hin"], np.float32))   # belief window [n,MEM,d]
-        mask_t = torch.from_numpy(np.asarray(b["cin"], bool))         # window validity [n,MEM]
-        idx_t = torch.tensor(b["idx"])
-        oldlp_t = torch.tensor(b["lp"])
+        tok_t, tmask_t = (t.to(device) for t in pad(b["tok"], TOKEN_DIM))
+        act_t, amask_t = (t.to(device) for t in pad(b["act"], ACT_DIM))
+        priv_t = torch.from_numpy(np.asarray(b["prv"], np.float32)).to(device)
+        hist_t = torch.from_numpy(np.asarray(b["hin"], np.float32)).to(device)
+        mask_t = torch.from_numpy(np.asarray(b["cin"], bool)).to(device)
+        idx_t = torch.tensor(b["idx"]).to(device)
+        oldlp_t = torch.tensor(b["lp"]).to(device)
         adv = (b["adv"] - b["adv"].mean()) / (b["adv"].std() + 1e-8)
-        adv_t = torch.from_numpy(adv)
-        ret_t = torch.from_numpy(b["ret"])
+        adv_t = torch.from_numpy(adv).to(device)
+        ret_t = torch.from_numpy(b["ret"]).to(device)
 
         n = len(b["idx"])
         pol_losses, val_losses, ents = [], [], []
@@ -293,6 +305,9 @@ def main():
     ap.add_argument("--eval-every", type=int, default=5)
     ap.add_argument("--eval-episodes", type=int, default=50)
     ap.add_argument("--eval-greedy-episodes", type=int, default=50)
+    ap.add_argument("--device", type=str, default="auto",
+                    choices=["auto", "cpu", "mps"],
+                    help="compute device (auto = mps > cpu)")
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--out", type=str, default="ppo_policy.pt")
     ap.add_argument("--dll", type=str, default=None)
