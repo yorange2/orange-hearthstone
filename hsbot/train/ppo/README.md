@@ -20,6 +20,12 @@ vs greedy  0.550   [95% CI 0.48–0.62]
 **The agent outperforms the one-ply greedy heuristic (~55%)** — the honest "do we beat a
 heuristic?" bar, not just "do we beat random?".
 
+> **Caveat on this number.** It was read off a `*best*` checkpoint selected as the max over
+> repeated 30-game evals, which biases high — reduced-budget replications dropped 8–18 points
+> when re-evaluated on a held-out seed over 200 games. See
+> [Model scale: bigger is not better here](#model-scale-bigger-is-not-better-here). The 55% has
+> not been re-measured at full budget on a held-out seed; treat it as optimistic until it is.
+
 **What got it there — imitation warm-start + PPO fine-tune.** PPO from scratch (even with the
 levers below) plateaus around ~40–47% vs greedy: a small model exploring from random weights
 rarely stumbles onto heuristic-level play. The breakthrough was a two-stage pipeline:
@@ -57,11 +63,23 @@ rarely stumbles onto heuristic-level play. The breakthrough was a two-stage pipe
   schedules, a greedy-prob curriculum, and best-checkpoint tracking. Also serves `--eval-only`.
 - **`device.py`**: `--device` resolution shared by both entry points. `auto` (the default) picks
   the first available of **cuda → mps → cpu**; an explicitly requested backend that isn't
-  available degrades to CPU with a warning. Note that a few transformer nested-tensor ops have
-  no MPS kernel and silently fall back to CPU, each fallback costing a device round-trip — which
-  is why MPS measures ~6× **slower** than CPU here (17 vs 105 steps/s on an M-series, `--size
-  small`). `auto` still honours the hardware; pass `--device cpu` on Apple silicon when
-  throughput matters.
+  available degrades to CPU with a warning.
+
+### Which device: it depends on the phase, not just the hardware
+
+Measured on an M-series (10-core), same model, so the only variable is where the tensors live:
+
+| phase | shapes | `small` | `100x` (17.6M) |
+| --- | --- | --- | --- |
+| PPO rollout (`collect_vec`) | tiny + **ragged**, change every step | CPU ~2× faster | CPU ~3× faster |
+| BC / PPO update | big fixed-ish batches (256–512) | MPS ~5× faster | MPS ~2.6× faster |
+
+MPS loses the rollout at **every** model size: the ragged token/action padding means the shape
+changes on nearly every call, which defeats MPS graph caching (a few nested-tensor ops also lack
+MPS kernels and fall back to CPU). It wins clearly on large-batch training, where one shape is
+reused. So the fastest recipe on Apple silicon is **`pretrain.py --device mps`, `ppo_vec.py
+--device cpu`** — about 2× faster end-to-end than using either device for both. `auto` cannot
+know this (it sees hardware, not phase), so pass `--device` explicitly when it matters.
 
 ### Self-play + greedy (opponent scheme)
 
@@ -158,6 +176,138 @@ because the greedy opponent's clone-heavy steps dominate wall time and the Pytho
 serial overhead; on a many-core + GPU box the batched inference pays off more and the gap
 widens. This throughput (plus the imitation warm-start) is what makes the ~55%-vs-greedy run
 finish in minutes on a laptop.
+
+## Model scale: bigger is not better here
+
+Controlled study across `--size`, **identical recipe and seed** for every arm (1500 BC games /
+8 epochs → 60 PPO iters × 4096 steps → 200-game eval vs greedy on a **held-out seed**), so the
+only variable is parameter count:
+
+| `--size` | params | BC top-1 | PPO wall-clock | vs greedy (200 games) |
+| --- | --- | --- | --- | --- |
+| `small` | 173k | **0.823** | **615 s** | **0.455** |
+| `xl` | 1.69M | 0.711 | 2508 s (4.1×) | 0.440 |
+| `100x` | 17.6M | 0.753 | 5693 s (9.3×) | 0.350 |
+
+Win rate **falls** monotonically as the model grows, at up to 9.3× the training cost. Two
+distinct causes, worth separating because only the first is fixable by tuning:
+
+1. **The big arms never optimized properly.** `100x`'s BC loss flatlines at ~1.2385 from epoch 2
+   onward (1.2390 → 1.2388 → 1.2385 → 1.2383 → 1.2387 …) — dead flat, accuracy stuck ~0.75,
+   while `small` reached 0.9122 and was still improving. `lr=1e-3` with no warmup collapses a
+   17.6M-param transformer into a degenerate solution; its PPO evals then swung 0.533 → 0.167 →
+   0.333. So this table is **not** evidence that capacity hurts — it is evidence that the
+   hyperparameters are tuned for `small` and do not transfer. Retry with LR warmup and a lower
+   LR before concluding anything about scale.
+2. **Capacity was never the bottleneck.** Data was held fixed while params grew 100× (86.6k BC
+   examples, 246k PPO transitions, one fixed Mage mirror). More fundamentally, the observation
+   itself caps achievable play — see below.
+
+**Note on `*best*` checkpoints.** Every arm dropped sharply from its reported `*best*` score to
+clean evaluation (`small` 0.567 → 0.455, `100x` 0.533 → 0.350). `*best*` takes the max over
+three 30-game evals (σ ≈ 0.09), so it selects noise. Re-evaluate on a held-out seed with more
+games before quoting a win rate — including the ~55% headline above, which was selected the
+same way.
+
+### Why ~50% vs greedy is close to this design's ceiling
+
+- **The agent sees strictly less than the heuristic it fights.** A token is 18 floats (type
+  one-hot, mine, cost, attack, health, 5 keyword flags, can-attack) — there is **no card
+  identity and no card text**. Two different 4-cost spells are the same input vector. Greedy
+  calls `MidRangeScore` through the real simulator with one-ply lookahead, so it implicitly
+  knows what every card does.
+- **Every training signal points at greedy.** BC initializes to ~82% action-match with greedy;
+  the shaping potential is `tanh(MidRangeScore.Rate()/200)` — *the greedy heuristic's own score
+  function* (`HearthstoneEnv.cs:147`); and the opponent is greedy 70% of the time. Shaping is
+  policy-invariant at convergence (Ng et al. 1999), but under a finite budget these three
+  anchors pull hard toward heuristic-level play.
+
+Highest-leverage fixes, in order: **add a card-identity embedding to the token** (removes the
+information ceiling), **decouple the shaping potential from `MidRangeScore`**, then raise the
+PPO sample budget. Model scale is the last lever, and only after LR warmup.
+
+## Plan: how to actually get past ~50% vs greedy
+
+Ordered by expected gain per unit of work, and derived from the measurements above rather than
+from generic RL advice. Each phase states the hypothesis it tests and the gate that decides
+whether to continue — several of these could fail, and the gates are there to find that out
+cheaply.
+
+### Phase 0 — Make the metric trustworthy *(blocking, ~1h)*
+
+Nothing downstream is measurable until this lands: a genuine 5-point gain is currently invisible
+inside the noise, and `*best*` selection inflates results by 8–18 points (see the note above).
+
+- Raise checkpoint-selection evals to ≥200 games, or stop selecting on them and evaluate the
+  final model instead
+- Standard eval: fixed **held-out** seed, **400 games**, report a Wilson 95% CI
+  (±0.049 at n=400, versus ±0.09 at the current n=30)
+- Add `--eval-seed` so eval seeds can never overlap training seeds
+- Re-measure `small` at full budget to establish one honest reference number
+
+**Gate:** a reference win rate with a confidence interval. Phases 1–4 are guesswork without it.
+
+### Phase 1 — Put card identity in the observation *(highest expected gain)*
+
+The hard information ceiling. A token is 18 floats with **no card ID and no card text**, so two
+different 4-cost spells are identical inputs and the policy cannot represent "Polymorph the 7/7"
+as distinct from "play a vanilla 4-drop". Greedy, by contrast, scores through the real simulator
+and implicitly knows what every card does.
+
+- `TokenEncoder.cs`: emit a card-ID index alongside the 18 floats
+- `env.py`: parse it into `Obs`
+- `ppo.py`: `nn.Embedding(vocab, 32)` concatenated into the token before `EntityEncoder`
+- Open question to settle first: SabberStone's card-ID space, and whether to embed all
+  collectibles or hash into a fixed vocab. Under `--fixed-deck` it is ~30 unique cards — start
+  there, widen later.
+
+Changes `TOKEN_DIM`, so it invalidates existing checkpoints. RL-only: the flat `FeatureExtractor`
+feeding the ONNX value net is a separate contract and is untouched.
+
+**Gate:** BC top-1 must clear the current 0.823 *before* spending anything on PPO. If it does
+not, the embedding is miswired — a cheap early signal.
+
+### Phase 2 — Decouple the reward from greedy *(cheap, high information)*
+
+Three anchors hold the policy at heuristic level, the strongest being that the shaping potential
+**is** greedy's own objective (`HearthstoneEnv.cs:147`).
+
+- Anneal `shaping_coef` → 0 over training so the final policy is not anchored
+- Ablate `--shaping-coef 0` vs `0.05` vs annealed at fixed budget
+- Consider a potential built from raw board state (health/tempo differential) instead of the
+  exact function greedy maximizes
+
+Genuinely uncertain: shaping is part of what makes the current run learn at all, so removing it
+may hurt before it helps. That is why it is an ablation, not a change.
+
+### Phase 3 — Give the agent the lookahead greedy already has
+
+Greedy is one-ply search + handcrafted score; the agent is **zero-ply** + learned score. Add a
+`simulate <idx>` endpoint to the C# env and score each legal action by the learned value of the
+resulting state. Largest structural gap after Phase 1, and it reuses the critic already being
+trained. Costs inference time (N simulations per decision), so measure it as an eval/deployment
+lever separately from training changes.
+
+### Phase 4 — Optimization hygiene, then re-test scale
+
+Only meaningful after Phases 0–1.
+
+- **LR warmup + lower LR for large models** — this is what broke `100x` above
+- Re-run the scale study with warmup, to answer the question the table above leaves open: does
+  capacity help once optimization is not broken?
+- Raise the PPO sample budget (1.6M transitions at the full recipe)
+- Free speedup already measured: BC on `mps`, PPO on `cpu` ≈ 2× end-to-end
+
+### Phase 5 — Opponent diversity
+
+`--opponent-strategies` already supports all five heuristics but defaults to `midrange` alone.
+Training against the full set should reduce overfitting to one opponent. Cheap; note that eval is
+vs midrange, so this may not move the headline number even if the policy is genuinely better.
+
+### Not on the list
+
+**Scaling the model further as a strength lever.** The evidence says capacity is not the binding
+constraint — information and signal are. Revisit only after Phase 1, and only with warmup.
 
 ## Upgrade paths
 
