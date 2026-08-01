@@ -24,8 +24,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from env import VecEnv, TOKEN_DIM, ACT_DIM
-from ppo import ActorCritic, gae, pad, evaluate
+from env import SabberEnv, VecEnv, TOKEN_DIM, ACT_DIM
+from ppo import ActorCritic, gae, pad, evaluate, wilson_ci
 
 
 @torch.no_grad()
@@ -150,6 +150,22 @@ def collect_vec(vec, main, greedy_prob, steps, gamma, shaping_coef, strategies, 
     return batch, ep_returns
 
 
+def run_eval(env, policy, episodes, opponent, eval_seed, argmax=True):
+    """One benchmark: returns (rate, lo, hi) with a Wilson 95% interval.
+
+    Every RNG evaluation touches is rebuilt from `eval_seed` on each call — the local `rng`
+    (seat + random opponent) and torch's global RNG (used by `dist.sample()` when argmax is
+    off) — so the reported rate moves only when the policy does, not when the draw changes."""
+    torch.manual_seed(eval_seed)
+    wins, n = evaluate(env, policy, episodes, opponent, rng=random.Random(eval_seed), argmax=argmax)
+    lo, hi = wilson_ci(wins, n)
+    return wins / max(n, 1), lo, hi
+
+
+def fmt_eval(rate, lo, hi):
+    return f"{rate:.3f} [{lo:.3f}-{hi:.3f}]"
+
+
 def cosine_lr(init_lr, decay_to, total_iters, current_iter):
     """Cosine annealing: decays from init_lr to decay_to over total_iters."""
     progress = min(current_iter / max(total_iters, 1), 1.0)
@@ -160,9 +176,15 @@ def train(args):
     args.opponent_strategies = [s.strip() for s in args.opponent_strategies.split(",")]
     device = resolve_device(args.device)
 
-    # Eval runs single-threaded on one env, so don't spawn the full training pool.
-    n_envs = 1 if args.eval_only else args.num_envs
-    vec = VecEnv(n_envs, seed0=args.seed, fixed_deck=args.fixed_deck, dll=args.dll, dotnet=args.dotnet)
+    if args.eval_seed in range(args.seed, args.seed + args.num_envs):
+        raise SystemExit(f"--eval-seed {args.eval_seed} collides with the training seeds "
+                         f"{args.seed}..{args.seed + args.num_envs - 1}; evaluation would not be held out")
+
+    # Evaluation gets its own env process, seeded from --eval-seed. It must NOT be a training
+    # env: those have had their RNG stream advanced by rollouts, so eval games were previously
+    # neither held out nor reproducible.
+    eval_env = SabberEnv(seed=args.eval_seed, fixed_deck=args.fixed_deck,
+                         dll=args.dll, dotnet=args.dotnet)
     main = ActorCritic(size=args.size).to(device)
     if args.resume or args.eval_only:
         ckpt = args.resume or args.eval_only
@@ -171,11 +193,15 @@ def train(args):
         print(f"loaded checkpoint from {ckpt}", flush=True)
 
     if args.eval_only:
-        wr_r = evaluate(vec.envs[0], main, args.eval_episodes, "random")
-        wr_g = evaluate(vec.envs[0], main, args.eval_greedy_episodes, "greedy")
-        print(f"vs random {wr_r:.3f}  |  vs greedy {wr_g:.3f}")
-        vec.close()
+        r = run_eval(eval_env, main, args.eval_episodes, "random", args.eval_seed, not args.eval_sample)
+        g = run_eval(eval_env, main, args.eval_greedy_episodes, "greedy", args.eval_seed, not args.eval_sample)
+        print(f"vs random {fmt_eval(*r)}  |  vs greedy {fmt_eval(*g)}"
+              f"   (eval-seed {args.eval_seed}, n={args.eval_episodes}/{args.eval_greedy_episodes})")
+        eval_env.close()
         return
+
+    vec = VecEnv(args.num_envs, seed0=args.seed, fixed_deck=args.fixed_deck,
+                 dll=args.dll, dotnet=args.dotnet)
 
     opt = torch.optim.Adam(main.parameters(), lr=args.lr)
 
@@ -244,10 +270,13 @@ def train(args):
                 f"lr {current_lr:.1e}  ent_coef {ent_coef:.4f}  "
                 f"pol {avg_pol:.3f}  val {avg_val:.3f}  ent {avg_ent:.3f}")
         if it % args.eval_every == 0:
-            wr_r = evaluate(vec.envs[0], main, args.eval_episodes, "random")
-            wr_g = evaluate(vec.envs[0], main, args.eval_greedy_episodes, "greedy")
-            line += f"  [vs random {wr_r:.3f} | vs greedy {wr_g:.3f}]"
-            # Track best model by vs-greedy win rate
+            r = run_eval(eval_env, main, args.eval_episodes, "random", args.eval_seed, not args.eval_sample)
+            g = run_eval(eval_env, main, args.eval_greedy_episodes, "greedy", args.eval_seed, not args.eval_sample)
+            wr_g = g[0]
+            line += f"  [vs random {fmt_eval(*r)} | vs greedy {fmt_eval(*g)}]"
+            # Track best model by vs-greedy win rate. Taking a max over repeated noisy evals
+            # biases high, so this is only meaningful when --eval-greedy-episodes is large
+            # enough that the interval is tighter than the differences being selected on.
             if wr_g > best_greedy_wr:
                 best_greedy_wr = wr_g
                 torch.save(main.state_dict(), best_path)
@@ -258,7 +287,10 @@ def train(args):
     print(f"saved final policy -> {args.out}")
     if best_greedy_wr >= 0:
         print(f"saved best policy (vs greedy {best_greedy_wr:.3f}) -> {best_path}")
+        print("note: the *best* score is a max over repeated evals and is biased high; "
+              "re-measure the checkpoint with --eval-only before quoting it", flush=True)
     vec.close()
+    eval_env.close()
 
 
 def main():
@@ -297,9 +329,18 @@ def main():
     ap.add_argument("--fixed-deck", action="store_true")
     ap.add_argument("--eval-only", type=str, default=None,
                     help="evaluate a checkpoint and exit (no training)")
-    ap.add_argument("--eval-every", type=int, default=5)
-    ap.add_argument("--eval-episodes", type=int, default=50)
-    ap.add_argument("--eval-greedy-episodes", type=int, default=50)
+    ap.add_argument("--eval-every", type=int, default=10)
+    # Wilson 95% half-width at p=0.5: n=50 -> ±0.134, n=200 -> ±0.069, n=400 -> ±0.049.
+    # Selecting a *best* checkpoint on 50-game evals reliably picked noise (8-18 point drops on
+    # re-measure). 200 narrows it a lot but still cannot resolve differences under ~0.14.
+    ap.add_argument("--eval-episodes", type=int, default=200)
+    ap.add_argument("--eval-greedy-episodes", type=int, default=200)
+    ap.add_argument("--eval-seed", type=int, default=100000,
+                    help="seed for the dedicated eval env + eval RNG; must not overlap the "
+                         "training seeds (--seed .. --seed+--num-envs-1) or eval is not held out")
+    ap.add_argument("--eval-sample", action="store_true",
+                    help="sample eval actions instead of taking argmax. Adds large variance "
+                         "(13-point swings between identical runs); argmax is the default")
     ap.add_argument("--device", type=str, default="auto", choices=DEVICE_CHOICES,
                     help="compute device (auto = cuda > mps > cpu)")
     ap.add_argument("--seed", type=int, default=1)

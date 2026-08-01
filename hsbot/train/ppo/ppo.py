@@ -4,6 +4,7 @@ Shared by ppo_vec.py (training), pretrain.py (imitation pre-training), and eval.
 Kept deliberately small: model definition, GAE, helper functions — no training loop.
 """
 from __future__ import annotations
+import math
 import random
 
 import numpy as np
@@ -123,9 +124,13 @@ class ActorCritic(nn.Module):
 
 
 @torch.no_grad()
-def act(policy, obs, hist_in, mask_in):
+def act(policy, obs, hist_in, mask_in, argmax=False):
     """One recurrent step. `(hist_in, mask_in)` is the belief window before this decision.
-    Returns (idx, logprob, value, hist_out, mask_out) — the shifted window carries to the next step."""
+    Returns (idx, logprob, value, hist_out, mask_out) — the shifted window carries to the next step.
+
+    `argmax=True` takes the highest-scoring legal action instead of sampling. Training must
+    sample (PPO needs on-policy log-probs); evaluation should not, because sampling injects
+    variance that swamps the effect being measured."""
     dev = next(policy.parameters()).device
     tk = torch.from_numpy(obs.tokens).unsqueeze(0).to(dev)
     tm = torch.ones(1, obs.tokens.shape[0], dtype=torch.bool, device=dev)
@@ -134,7 +139,7 @@ def act(policy, obs, hist_in, mask_in):
     am = torch.ones(1, obs.actions.shape[0], dtype=torch.bool, device=dev)
     logits, v, hist, mask = policy(tk, tm, hist_in.to(dev), mask_in.to(dev), p, a, am)
     dist = torch.distributions.Categorical(logits=logits[0])
-    idx = dist.sample()
+    idx = logits[0].argmax() if argmax else dist.sample()
     return int(idx), float(dist.log_prob(idx)), float(v[0]), hist.cpu(), mask.cpu()
 
 
@@ -166,21 +171,46 @@ def pad(seqs, dim):
 OPPONENT_STRATEGIES = ["midrange", "aggro", "control", "fatigue", "ramp"]
 
 
+def wilson_ci(wins, n, z=1.96):
+    """Wilson score interval for a binomial proportion — the right interval for win rates.
+
+    Preferred over the normal approximation p ± z·sqrt(p(1-p)/n), which misbehaves near 0 and 1
+    (it happily reports bounds outside [0,1], e.g. for the 1.000 vs-random results here).
+    Returns (lo, hi); at n=0 returns (0.0, 1.0)."""
+    if n <= 0:
+        return 0.0, 1.0
+    p = wins / n
+    denom = 1.0 + z * z / n
+    centre = (p + z * z / (2 * n)) / denom
+    half = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / denom
+    return max(0.0, centre - half), min(1.0, centre + half)
+
+
 @torch.no_grad()
-def evaluate(env, main, episodes, opponent="random"):
-    """Benchmark the recurrent main policy vs a fixed opponent. Returns win rate.
-    opponent: "random", "greedy"/"midrange", or any of "aggro","control","fatigue","ramp"."""
+def evaluate(env, main, episodes, opponent="random", rng=None, argmax=True):
+    """Benchmark the recurrent main policy vs a fixed opponent. Returns (wins, episodes) so the
+    caller can attach a confidence interval — a bare rate invites reading noise as signal.
+    opponent: "random", "greedy"/"midrange", or any of "aggro","control","fatigue","ramp".
+
+    `rng` seeds seat assignment and the random opponent. Pass a dedicated `random.Random` so
+    evaluation neither consumes nor depends on the global RNG that training is driving — that
+    coupling is what made past evals unreproducible.
+
+    `argmax=True` (default) evaluates the policy deterministically. With sampling, two identical
+    eval commands on the same checkpoint differed by 13 points (0.333 vs 0.467 over 60 games),
+    because `dist.sample()` draws from the global torch RNG."""
+    rng = rng if rng is not None else random.Random()
     wins = 0
     for _ in range(episodes):
         obs = env.reset()
-        seat = random.choice((1, 2))
+        seat = rng.choice((1, 2))
         hist, mask = main.initial_state()
         while True:
             if obs.player == seat:
-                i, _, _, hist, mask = act(main, obs, hist, mask)
+                i, _, _, hist, mask = act(main, obs, hist, mask, argmax=argmax)
                 obs, done, winner = env.step(i)
             elif opponent == "random":
-                obs, done, winner = env.step(int(np.random.randint(obs.actions.shape[0])))
+                obs, done, winner = env.step(rng.randrange(obs.actions.shape[0]))
             else:
                 # "greedy" / "midrange" / "aggro" / "control" / "fatigue" / "ramp"
                 strat = "midrange" if opponent == "greedy" else opponent
@@ -188,4 +218,4 @@ def evaluate(env, main, episodes, opponent="random"):
             if done:
                 wins += int(winner == seat)
                 break
-    return wins / max(episodes, 1)
+    return wins, episodes

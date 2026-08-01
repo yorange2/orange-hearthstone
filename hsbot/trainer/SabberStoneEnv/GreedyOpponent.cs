@@ -44,7 +44,11 @@ public static class GreedyOpponent
         int bestIdx = 0, bestRate = int.MinValue;
         for (int i = 0; i < n; i++)
         {
-            Game clone = game.Clone();
+            // resetRandomSeed: false — the default (true) hands every clone a fresh time-based
+            // Random, which makes greedy's own choice nondeterministic whenever an option's
+            // outcome involves RNG. Inheriting the parent's stream also evaluates all options
+            // under the same draw, so the one-ply comparison is apples-to-apples.
+            Game clone = game.Clone(resetRandomSeed: false);
             var opts = clone.CurrentPlayer.Options(); // same order as original (same state)
             clone.Process(opts[i]);
             // Rate the acting player's resulting state (CurrentPlayer flips after END_TURN).
