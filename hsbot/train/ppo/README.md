@@ -233,19 +233,48 @@ from generic RL advice. Each phase states the hypothesis it tests and the gate t
 whether to continue — several of these could fail, and the gates are there to find that out
 cheaply.
 
-### Phase 0 — Make the metric trustworthy *(blocking, ~1h)*
+### Phase 0 — Make the metric trustworthy ✅ *(done — tooling landed; reference run pending)*
 
 Nothing downstream is measurable until this lands: a genuine 5-point gain is currently invisible
 inside the noise, and `*best*` selection inflates results by 8–18 points (see the note above).
 
+> **What this turned up: the environment was not deterministic.** Chasing "why do two identical
+> eval commands disagree?" found three independent causes, in increasing order of severity:
+>
+> 1. Evaluation ran on `vec.envs[0]` — a **training** env whose RNG stream had already been
+>    advanced by rollouts, so eval was never held out.
+> 2. `act()` sampled from the policy (`dist.sample()`) during evaluation, drawing on the global
+>    torch RNG. Two identical runs on one checkpoint gave **0.333 vs 0.467** over 60 games.
+> 3. The real one: `GameConfig.RandomSeed` was never set, so SabberStone built a **time-based**
+>    RNG (`Game.cs:276`) and every shuffle/draw differed run to run — and `GreedyOpponent`
+>    cloned with the default `resetRandomSeed: true`, handing each one-ply lookahead clone a
+>    fresh time-based RNG, making *greedy itself* nondeterministic. A pure greedy-vs-greedy
+>    probe at a fixed seed produced completely different games on every run.
+>
+> All three are fixed. The same probe now yields byte-identical games across runs, and repeated
+> `--eval-only` invocations agree exactly. This also makes **training** reproducible for the
+> first time, which is a prerequisite for trusting any A/B comparison in Phases 1–5.
+
 - Raise checkpoint-selection evals to ≥200 games, or stop selecting on them and evaluate the
   final model instead
-- Standard eval: fixed **held-out** seed, **400 games**, report a Wilson 95% CI
-  (±0.049 at n=400, versus ±0.09 at the current n=30)
-- Add `--eval-seed` so eval seeds can never overlap training seeds
-- Re-measure `small` at full budget to establish one honest reference number
+- Standard eval: fixed **held-out** seed, **400 games**, report a Wilson 95% CI. Half-width at
+  p=0.5: n=30 → **±0.168**, n=50 → ±0.134, n=200 → ±0.069, n=400 → **±0.049**. (Note this is the
+  interval half-width, not the standard error σ≈0.09 quoted for n=30 above — the interval is
+  ~1.96× wider.) Sobering consequence: even n=400 only resolves a single rate to ±5 points, and
+  *comparing two arms* has √2× the error, so separating policies ~5 points apart needs ~1500
+  games each. Prefer changes big enough to clear the interval over tuning for small gains.
+- Add `--eval-seed` so eval seeds can never overlap training seeds — it now hard-errors on
+  collision with `--seed .. --seed+--num-envs-1` rather than silently reporting a non-held-out
+  number
+- Evaluate with **argmax** by default (`--eval-sample` restores sampling), removing the largest
+  remaining variance source
+- Re-measure `small` at full budget to establish one honest reference number *(still pending)*
 
 **Gate:** a reference win rate with a confidence interval. Phases 1–4 are guesswork without it.
+
+Note that fixing determinism **changes the numbers**: every win rate recorded before this point
+was measured under a nondeterministic env with a sampling policy, so the scaling table above is
+not directly comparable to anything measured after. Re-baseline before comparing.
 
 ### Phase 1 — Put card identity in the observation *(highest expected gain)*
 

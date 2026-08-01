@@ -80,6 +80,11 @@ public sealed class HearthstoneEnv
         CardClass p2 = _fixedDeck ? CardClass.MAGE : Classes[_rnd.Next(Classes.Length)];
         _game = new Game(new GameConfig
         {
+            // Derive the game's own RNG from the env seed. Without this, GameConfig.RandomSeed is
+            // null and SabberStone builds a time-based Random (Game.cs:276), so shuffles/draws —
+            // and therefore whole games — differ run to run even at a fixed env seed. That made
+            // evaluation unreproducible: identical eval commands on one checkpoint swung 13 points.
+            RandomSeed = _rnd.Next(),
             StartPlayer = _rnd.Next(1, 3),
             Player1HeroClass = p1,
             Player2HeroClass = p2,
