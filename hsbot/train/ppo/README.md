@@ -17,6 +17,13 @@ This is the Phase 0 reference measurement, run under the post-determinism protoc
 policy, **held-out** eval seeds disjoint from training, **400 games per seed**, repeated over
 **three independent seeds** so the headline does not rest on one draw. Wilson 95% CIs.
 
+> **These numbers are now historical.** Every checkpoint below is card-blind, and the card-blind
+> and learned-id model paths were removed in favour of card text (see
+> [Card identity is text-only](#card-identity-is-text-only)). This code can no longer load them,
+> so the table cannot be re-run at HEAD — reproduce it from a commit before the removal, or
+> retrain to establish a new reference. The measurement was sound when taken; it is simply no
+> longer reachable from this tree.
+
 | checkpoint | seed 100000 | seed 200000 | seed 300000 | pooled (n=1200) |
 | --- | --- | --- | --- | --- |
 | `ppo_medium_best` (532k) | 0.578 | 0.560 | 0.630 | **0.589** [0.561–0.617] |
@@ -180,15 +187,22 @@ Two distinct "transformer" opportunities exist; this implements the higher-lever
 dotnet build hsbot/trainer/SabberStoneEnv -c Release
 
 cd hsbot/train/ppo
+# 0. build the card-text embedding matrix once (required — it is the only card-identity path,
+#    and it is a generated artifact, not checked in)
+python card_text.py --out card_text_emb.npz
+
 # 1. imitation warm-start: clone the greedy heuristic (~85% action match)
 python pretrain.py --games 2000 --fixed-deck --out pretrained.pt
 
-# 2. PPO fine-tune from the warm start (beats greedy ~55%)
+# 2. PPO fine-tune from the warm start
 python ppo_vec.py --resume pretrained.pt --fixed-deck --out ppo_policy.pt
 
 # 3. evaluate a checkpoint (no training)
 python ppo_vec.py --eval-only ppo_policy_best.pt --fixed-deck --num-envs 1
 ```
+
+Step 0 is not optional: both entry points load `card_text_emb.npz` from beside the script and
+hard-error with this command if it is absent, rather than silently training a card-blind model.
 
 `ppo_vec.py` saves both the final `ppo_policy.pt` and the best-vs-greedy `ppo_policy_best.pt`.
 Pass `--dll`/`--dotnet` to point at a specific env build or runtime; otherwise `dotnet` must be
@@ -376,8 +390,9 @@ like a serious confound with the capacity question — but only **471** distinct
 appear in fixed-deck play, so roughly **7.5k** embedding params ever receive a gradient. Report
 both numbers; the nominal figure overstates the added capacity by ~18×.
 
-Existing checkpoints do not load into a card-embedding model (`--no-card-emb` restores the old
-card-blind architecture, and is the ablation control). RL-only: the flat `FeatureExtractor`
+Existing checkpoints do not load into a card-embedding model. (`--no-card-emb` was the ablation
+control at the time; it has since been removed along with the learned-id path — see
+[Card identity is text-only](#card-identity-is-text-only).) RL-only: the flat `FeatureExtractor`
 feeding the ONNX value net is a separate contract and is untouched.
 
 **Gate:** BC top-1 must clear the current 0.823 *before* spending anything on PPO. If it does
@@ -419,7 +434,7 @@ vary decks (so identity carries signal) and stop using a stats-driven heuristic 
 target. Whether the embedding earns its place under PPO is measured in the A/B/C below —
 **it does not**.
 
-### Phase 1b — Card *text* instead of card ID ✅ *(implemented; evaluated — no win-rate gain)*
+### Phase 1b — Card *text* instead of card ID ✅ *(implemented; no in-distribution gain — zero-shot untested)*
 
 The reason the ID embedding is weak is structural, not a tuning problem: it has to **learn** what
 each card does from gradients, so only cards that actually appear ever acquire meaning. 471 of
@@ -432,8 +447,8 @@ paths (fixed Mage mirror → the real deck the live bot plays): a new deck is mo
 model projects it to `card_dim` with a small trained layer:
 
 ```
-python card_text.py --out card_text_emb.npz          # once, offline
-python pretrain.py --card-text card_text_emb.npz --deck variedmirror ...
+python card_text.py --out card_text_emb.npz          # once, offline (required)
+python pretrain.py --deck variedmirror ...           # picks it up automatically
 ```
 
 Meaning is *read* rather than learned, so all 8303 rows are populated before a single game is
@@ -442,9 +457,9 @@ inverts nicely:
 
 | card identity | total params | **trainable** | added trainable | rows with meaning |
 | --- | --- | --- | --- | --- |
-| none (card-blind) | 173,122 | 173,122 | — | 0 |
-| learned id embedding | 306,994 | 306,994 | +133,872 | 471 |
-| **frozen text embedding** | 706,578 | **175,186** | **+2,064** | **8303** |
+| none (card-blind) *(removed)* | 173,122 | 173,122 | — | 0 |
+| learned id embedding *(removed)* | 306,994 | 306,994 | +133,872 | 471 |
+| **frozen text embedding** *(the only path)* | 706,578 | **175,186** | **+2,064** | **8303** |
 
 **65× fewer trainable params than the ID table, for every card instead of 6% of them.** That also
 settles the capacity confound the scale study raised: this arm adds information while *reducing*
@@ -519,6 +534,38 @@ neutral Standard pool looks like.
 3. Conversely the card-text case is *stronger* than argued: the setting always had ~471 distinct
    cards in play, so there was real card variety for a semantic embedding to exploit, and the
    "nothing unseen to generalise to" objection does not apply.
+
+### Card identity is text-only
+
+The learned-id embedding and the card-blind mode were **removed**; `card_text` is the only card
+identity path, and `EntityEncoder` raises without it. `--no-card-emb` and the id-embedding
+branch no longer exist, and `pretrain.py` / `ppo_vec.py` load `card_text_emb.npz` from beside the
+script by default, erroring with the build command if it is missing.
+
+Rationale, and the honest counter-case, because this deletes evidence as well as code:
+
+**For.** In-distribution the three arms were indistinguishable (~0.49–0.50 over 7200 games), so
+nothing was lost on the measured axis. Off-distribution they are not equivalent: on a card that
+never appeared in training, `blind` has no card signal and the learned table returns a
+**random-init row silently** — indistinguishable from a real embedding, which is worse than no
+signal. Card text is the only one of the three whose behaviour on an unseen card is defined, and
+it costs +2,064 trainable params against the id table's +133,872. The deployment path (fixed
+mirror → the real deck the live bot plays) is entirely the unseen-card case.
+
+**Against, recorded deliberately.** This removal costs three things:
+
+1. **The 0.578 reference is no longer reproducible from this tree.** Every checkpoint behind it
+   is card-blind and will not load. `ppo_vec.py` detects this and says so by name rather than
+   emitting a six-tensor `state_dict` error, but the number itself is now historical.
+2. **The ablation control is gone.** "Does card identity help at all?" can no longer be asked at
+   HEAD; answering it again means reverting or re-adding the path.
+3. **The zero-shot test lost its comparison arms.** The experiment that would actually justify
+   card text — train on card-pool side A, evaluate on side B, where `id` and `blind` should
+   degrade to guessing by construction — now has nothing to compare against. That test is
+   *recommended* below and remains unrun.
+
+The decision was made with these costs stated. `git revert` restores the paths if any of the
+three is wanted back.
 
 ### Phase 1c — Varied decks ✅ *(implemented; used as the card-identity testbed)*
 
@@ -598,7 +645,7 @@ recipe and seed**, differing only in the new features:
 
 | | arm A (control) | arm B (Phase 1+2+4+5) |
 | --- | --- | --- |
-| card identity | `--no-card-emb` | `--card-dim 16` |
+| card identity | `--no-card-emb` *(removed)* | `--card-dim 16` *(id path removed)* |
 | shaping potential | `midrange` (greedy's own objective) | `--potential board --shaping-end 0.0` |
 | LR schedule | cosine, no warmup | `--warmup-iters 5` |
 | opponent | `midrange` | `--opponent-strategies all` |
@@ -649,6 +696,23 @@ fixed         text - id   : +0.006  [-0.034, +0.046]
 distribution.** Phase 1 was ranked first in this plan as "the hard information ceiling"; it has
 now failed twice — on BC top-1 (fixed decks) and on win rate (varied decks) — and the text
 variant, which removes the ID embedding's coverage problem entirely, did no better.
+
+> **Scope: this says nothing about zero-shot, which is what card text is *for*.** Every arm here
+> trained and evaluated on the same card pool — `variedmirror` draws from Mage/Hunter/Warrior/
+> Paladin, and across ~245k transitions the policy sees essentially every card it is later scored
+> on. Even the `fixed` eval is cross-*deck-mode*, not cross-*card*: Mage cards were in training.
+> So the property the text embedding exists to provide — a usable representation for cards that
+> **never appeared in training** — is untested here, not refuted. That property is also the one
+> the deployment path depends on (fixed mirror → the real deck the live bot plays), where most
+> cards are new and an ID embedding necessarily reads random vectors. Read this result as "card
+> identity does not help *in-distribution* at this budget", and keep `--card-text` on that basis:
+> its cost is +2,064 trainable params, and it is the only one of the three arms whose behaviour
+> on an unseen card is defined at all.
+>
+> The test that would settle it: partition the card pool, build training decks only from side A
+> and eval decks only from side B, and compare `text` against `id` and `blind`. `id` and `blind`
+> should degrade to guessing on B by construction; `text` should not. Until that runs, neither
+> the case for nor the case against card text is closed.
 
 **The finding worth keeping is the transfer failure.** On varied decks the BC stage separated
 cleanly and in the predicted order:
