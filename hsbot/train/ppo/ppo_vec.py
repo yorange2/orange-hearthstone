@@ -190,7 +190,7 @@ def train(args):
         args.opponent_strategies = list(OPPONENT_STRATEGIES)
     else:
         args.opponent_strategies = [s.strip() for s in args.opponent_strategies.split(",")]
-    device = resolve_device(args.device)
+    device = resolve_device(args.device, phase="rollout")  # rollout dominates; CPU wins ~9x
 
     if args.eval_seed in range(args.seed, args.seed + args.num_envs):
         raise SystemExit(f"--eval-seed {args.eval_seed} collides with the training seeds "

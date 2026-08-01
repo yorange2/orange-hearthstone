@@ -100,8 +100,22 @@ Measured on an M-series (10-core), same model, so the only variable is where the
 
 | phase | shapes | `small` | `100x` (17.6M) |
 | --- | --- | --- | --- |
-| PPO rollout (`collect_vec`) | tiny + **ragged**, change every step | CPU ~2× faster | CPU ~3× faster |
-| BC / PPO update | big fixed-ish batches (256–512) | MPS ~5× faster | MPS ~2.6× faster |
+| PPO rollout (`collect_vec`) | tiny + **ragged**, change every step | **CPU ~9.5×** faster | CPU ~3× faster |
+| BC / PPO update | big fixed-ish batches (256–512) | **MPS ~2.5×** faster | MPS ~2.6× faster |
+
+Re-measured back to back on an M-series (10-core), `small`. Both directions in the original table
+held up; both magnitudes were off, in opposite directions:
+
+```
+BC, 3 epochs, blind    cpu 23.12s   mps 12.19s     MPS 2.5x        (was quoted 5x)
+BC, 3 epochs, text     cpu 22.93s   mps 11.60s     MPS 2.6x
+PPO 5 iters x 2048     cpu 990 st/s mps 104 st/s   CPU 9.5x        (was quoted 2x)
+```
+
+The BC totals include a device-independent data-generation step (~4.8s) and process startup, so
+the true training-phase MPS advantage is larger than 2.5×. The rollout gap of 9.5× is close to
+the ~6× recorded independently in `device.py`, and much larger than the 2× this table claimed —
+so the case for `ppo_vec.py --device cpu` is *stronger* than it appeared, not weaker.
 
 MPS loses the rollout at **every** model size: the ragged token/action padding means the shape
 changes on nearly every call, which defeats MPS graph caching. It wins clearly on large-batch
@@ -122,9 +136,11 @@ when it matters.
 > would be a no-op, and the real cause of MPS's rollout loss is most plausibly per-call dispatch
 > overhead on small, constantly-reshaped tensors rather than anything mask-related.
 >
-> Note also that `device.py` prints its "MPS ~6× slower" warning **unconditionally**, including
-> during BC — the one phase this table says MPS *wins*. Those are in tension; the row for
-> `BC / PPO update` is being re-measured.
+> That tension is now resolved. `device.py` used to print its "MPS ~6× slower" warning
+> **unconditionally**, including during BC — the one phase where MPS is the right choice, so the
+> warning told the reader the opposite of the right thing. `resolve_device` now takes a
+> `phase` argument (`"batch"` for BC, `"rollout"` for PPO) and prints advice that matches the
+> measurement.
 
 ### Self-play + greedy (opponent scheme)
 

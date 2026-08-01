@@ -135,7 +135,9 @@ def main():
 
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
-    device = resolve_device(args.device)  # resolved up front so a bad device fails before phase 1
+    # phase="batch": BC is big fixed-shape minibatches, where MPS wins ~2.5x. The generic
+    # rollout warning would tell the reader the opposite of the right thing here.
+    device = resolve_device(args.device, phase="batch")  # up front so a bad device fails before phase 1
 
     # Phase 1: generate data
     print(f"Phase 1: generating data ({args.games} greedy-vs-greedy games)...", flush=True)
