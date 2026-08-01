@@ -416,9 +416,10 @@ already contain the seeds of:
 this does not refute that for *play* — but it does mean the cheap gate cannot confirm it, and
 the honest next test is the PPO arm, not another BC run. A stronger version of Phase 1 would
 vary decks (so identity carries signal) and stop using a stats-driven heuristic as the imitation
-target. Whether the embedding earns its place under PPO is measured in the A/B below.
+target. Whether the embedding earns its place under PPO is measured in the A/B/C below —
+**it does not**.
 
-### Phase 1b — Card *text* instead of card ID ✅ *(implemented; not yet evaluated)*
+### Phase 1b — Card *text* instead of card ID ✅ *(implemented; evaluated — no win-rate gain)*
 
 The reason the ID embedding is weak is structural, not a tuning problem: it has to **learn** what
 each card does from gradients, so only cards that actually appear ever acquire meaning. 471 of
@@ -519,7 +520,7 @@ neutral Standard pool looks like.
    cards in play, so there was real card variety for a semantic embedding to exploit, and the
    "nothing unseen to generalise to" objection does not apply.
 
-### Phase 1c — Varied decks ✅ *(implemented; not yet evaluated)*
+### Phase 1c — Varied decks ✅ *(implemented; used as the card-identity testbed)*
 
 `--deck` adds modes. The motivation is no longer "add card variety" (there already was some) but
 **a fair mirror and a wider pool**:
@@ -619,6 +620,84 @@ above); the PPO arms were started and then cancelled before either finished, so 
 win-rate numbers for this comparison and none should be inferred. The protocol above is recorded
 as pre-registered — if this is picked up later, run it as written rather than re-deciding the
 success criterion after seeing results.*
+
+### A/B/C: does card identity help at all? ❌ *(run — null result)*
+
+The four-factor A/B above was cancelled in favour of the question underneath it: **does card
+identity, in any form, change how well the agent plays?** One factor, three arms, identical
+recipe and seed (1500 BC games / 8 epochs → 60 PPO iters × 4096 steps → held-out eval), on
+`variedmirror` so card semantics have room to matter. Scored per the pre-registered protocol:
+**final** checkpoint (not `*best*`), 400 games × 3 held-out seeds, argmax. 7200 games total.
+
+| eval deck | `blind` | `id` embedding | `text` embedding |
+| --- | --- | --- | --- |
+| `variedmirror` (in-distribution) | **0.500** [0.472–0.528] | 0.482 [0.453–0.510] | 0.493 [0.465–0.522] |
+| `fixed` (never trained on) | 0.495 [0.467–0.523] | 0.490 [0.462–0.518] | 0.496 [0.468–0.524] |
+
+Every pairwise contrast spans zero:
+
+```
+variedmirror  id   - blind: -0.018  [-0.058, +0.022]
+variedmirror  text - blind: -0.007  [-0.047, +0.033]
+variedmirror  text - id   : +0.012  [-0.028, +0.052]
+fixed         id   - blind: -0.005  [-0.045, +0.035]
+fixed         text - blind: +0.001  [-0.039, +0.041]
+fixed         text - id   : +0.006  [-0.034, +0.046]
+```
+
+**Card identity produced no measurable win-rate gain, in either form, on either deck
+distribution.** Phase 1 was ranked first in this plan as "the hard information ceiling"; it has
+now failed twice — on BC top-1 (fixed decks) and on win rate (varied decks) — and the text
+variant, which removes the ID embedding's coverage problem entirely, did no better.
+
+**The finding worth keeping is the transfer failure.** On varied decks the BC stage separated
+cleanly and in the predicted order:
+
+| arm | BC loss | train top-1 | held-out top-1 (n=500) |
+| --- | --- | --- | --- |
+| blind | 1.0346 | 0.749 | 0.754 |
+| id | 1.0175 | 0.760 | 0.768 |
+| **text** | **0.9719** | **0.771** | 0.768 |
+
+That advantage **completely vanished in play**. Better imitation of greedy did not produce better
+results against greedy. This is the strongest evidence yet that the BC gate is the wrong
+instrument for judging an observation change — it measures agreement with a stats-driven teacher,
+and a richer observation buys agreement without buying strength. Future phases should not gate on
+it. (It also retires the earlier hope that Phase 1's flat BC gate was a fixed-deck artifact: on
+varied decks the gate moved and the win rate still did not.)
+
+**Why all six cells sit below the 0.578 reference — the control.** Every arm lands at ~0.49–0.50,
+including on `fixed`, which raised two candidate explanations: varied-mirror is harder at equal
+budget, or this recipe is under-trained relative to whatever produced the reference `*best*`
+checkpoints. A `blind` arm trained on `fixed` with *this exact recipe* separates them (BC reused
+from the cancelled A/B, whose flags were identical apart from the deck mode):
+
+| arm | trained on | eval deck | pooled (n=1200) |
+| --- | --- | --- | --- |
+| control | `fixed` | `fixed` | **0.533** [0.505–0.561] |
+| experiment `blind` | `variedmirror` | `fixed` | 0.495 [0.467–0.523] |
+| experiment `blind` | `variedmirror` | `variedmirror` | 0.500 [0.472–0.528] |
+
+```
+train-on-fixed minus train-on-varied (both eval fixed):  +0.038  [-0.002, +0.078]
+control minus the 0.578 reference:                       -0.045  [-0.084, -0.005]
+```
+
+**Both effects are real, and they split the gap roughly in half.** The recipe is genuinely weaker
+than whatever produced the reference — −4.5 points, and that interval excludes zero, so some of
+the 0.578 headline rests on longer training and on `*best*` selection that this protocol
+deliberately refuses. Training on varied decks costs a further ~3.8 points, which at n=1200 falls
+*just* short of significance (the interval grazes zero at −0.002) and should be read as suggestive
+rather than established.
+
+The practically important line: **the control still beats greedy** (lower bound 0.505 > 0.5),
+while all three varied-trained arms sit at parity. So varied-mirror is a materially harder task,
+and the budget that suffices on `fixed` does not carry over.
+
+None of this rescues card identity. The control shares the `blind` arm's observation, so the gap
+it explains is a *budget and task-difficulty* gap, present identically in all three arms — it
+cannot mask a card-identity effect, which was measured within a single deck mode at fixed
+budget.
 
 ### Not on the list
 
