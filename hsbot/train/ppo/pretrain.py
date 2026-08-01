@@ -74,14 +74,14 @@ def pretrain(policy, data, epochs, batch_size, lr, device):
 
         avg = float(np.mean(epoch_losses))
         losses.append(avg)
-        acc = evaluate_imitation(policy, data[:min(1000, n)])
+        acc = evaluate_imitation(policy, data[:min(1000, n)], device)
         print(f"  epoch {ep + 1:3d}/{epochs}  loss {avg:.4f}  top-1 acc {acc:.3f}", flush=True)
 
     return losses
 
 
 @torch.no_grad()
-def evaluate_imitation(policy, data):
+def evaluate_imitation(policy, data, device="cpu"):
     """Top-1 accuracy: does the policy pick the same action as greedy?"""
     policy.eval()
     correct = 0
@@ -90,10 +90,11 @@ def evaluate_imitation(policy, data):
         tok, tmask = pad([b["tokens"] for b in batch], TOKEN_DIM)
         act, amask = pad([b["actions"] for b in batch], ACT_DIM)
         target = np.array([b["idx"] for b in batch])
-        priv = torch.zeros(len(batch), PRIV_DIM)
-        hist, mask = policy.initial_state(len(batch))
-        logits, _, _, _ = policy(tok, tmask, hist, mask, priv, act, amask)
-        pred = logits.argmax(dim=1).numpy()
+        priv = torch.zeros(len(batch), PRIV_DIM, device=device)
+        hist, mask = (t.to(device) for t in policy.initial_state(len(batch)))
+        logits, _, _, _ = policy(tok.to(device), tmask.to(device), hist, mask,
+                                  priv, act.to(device), amask.to(device))
+        pred = logits.argmax(dim=1).cpu().numpy()
         correct += (pred == target).sum()
     policy.train()
     return correct / len(data)
@@ -107,6 +108,8 @@ def main():
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--size", type=str, default="small",
                     choices=["small", "medium", "large", "xl"])
+    ap.add_argument("--device", type=str, default="auto",
+                    choices=["auto", "cpu", "mps"])
     ap.add_argument("--out", type=str, default="pretrained.pt")
     ap.add_argument("--fixed-deck", action="store_true")
     ap.add_argument("--seed", type=int, default=42)
@@ -127,11 +130,15 @@ def main():
     print(f"Generated {len(data)} training examples in {dt:.1f}s", flush=True)
 
     # Phase 2: pre-train
-    print(f"\nPhase 2: behavioral cloning ({args.epochs} epochs)...", flush=True)
-    policy = ActorCritic(size=args.size)
+    device = args.device if args.device != "auto" else "cpu"
+    if device == "mps":
+        import os; os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+        print("note: MPS is ~10× slower than CPU for this transformer model", flush=True)
+    print(f"\nPhase 2: behavioral cloning ({args.epochs} epochs, device={device})...", flush=True)
+    policy = ActorCritic(size=args.size).to(device)
     params = sum(p.numel() for p in policy.parameters())
     print(f"Model: {args.size} ({params:,} params)", flush=True)
-    pretrain(policy, data, args.epochs, args.batch_size, args.lr, device="cpu")
+    pretrain(policy, data, args.epochs, args.batch_size, args.lr, device=device)
 
     # Phase 3: save
     torch.save(policy.state_dict(), args.out)
@@ -139,7 +146,7 @@ def main():
 
     # Quick sanity check
     policy.eval()
-    acc = evaluate_imitation(policy, data[:min(500, len(data))])
+    acc = evaluate_imitation(policy, data[:min(500, len(data))], device)
     print(f"Final top-1 accuracy on 500 samples: {acc:.3f}", flush=True)
 
 

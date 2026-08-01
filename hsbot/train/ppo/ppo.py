@@ -123,15 +123,16 @@ class ActorCritic(nn.Module):
 def act(policy, obs, hist_in, mask_in):
     """One recurrent step. `(hist_in, mask_in)` is the belief window before this decision.
     Returns (idx, logprob, value, hist_out, mask_out) — the shifted window carries to the next step."""
-    tk = torch.from_numpy(obs.tokens).unsqueeze(0)
-    tm = torch.ones(1, obs.tokens.shape[0], dtype=torch.bool)
-    p = torch.from_numpy(obs.priv).unsqueeze(0)
-    a = torch.from_numpy(obs.actions).unsqueeze(0)
-    am = torch.ones(1, obs.actions.shape[0], dtype=torch.bool)
-    logits, v, hist, mask = policy(tk, tm, hist_in, mask_in, p, a, am)
+    dev = next(policy.parameters()).device
+    tk = torch.from_numpy(obs.tokens).unsqueeze(0).to(dev)
+    tm = torch.ones(1, obs.tokens.shape[0], dtype=torch.bool, device=dev)
+    p = torch.from_numpy(obs.priv).unsqueeze(0).to(dev)
+    a = torch.from_numpy(obs.actions).unsqueeze(0).to(dev)
+    am = torch.ones(1, obs.actions.shape[0], dtype=torch.bool, device=dev)
+    logits, v, hist, mask = policy(tk, tm, hist_in.to(dev), mask_in.to(dev), p, a, am)
     dist = torch.distributions.Categorical(logits=logits[0])
     idx = dist.sample()
-    return int(idx), float(dist.log_prob(idx)), float(v[0]), hist, mask
+    return int(idx), float(dist.log_prob(idx)), float(v[0]), hist.cpu(), mask.cpu()
 
 
 def gae(rewards, values, dones, last_v, gamma=1.0, lam=0.95):
