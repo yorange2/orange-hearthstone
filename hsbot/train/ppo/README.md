@@ -55,6 +55,13 @@ rarely stumbles onto heuristic-level play. The breakthrough was a two-stage pipe
   heuristic (~85% top-1). The resulting checkpoint is a strong warm start for PPO.
 - **`ppo_vec.py`**: the training loop — vectorized self-play + greedy PPO with LR/entropy
   schedules, a greedy-prob curriculum, and best-checkpoint tracking. Also serves `--eval-only`.
+- **`device.py`**: `--device` resolution shared by both entry points. `auto` (the default) picks
+  the first available of **cuda → mps → cpu**; an explicitly requested backend that isn't
+  available degrades to CPU with a warning. Note that a few transformer nested-tensor ops have
+  no MPS kernel and silently fall back to CPU, each fallback costing a device round-trip — which
+  is why MPS measures ~6× **slower** than CPU here (17 vs 105 steps/s on an M-series, `--size
+  small`). `auto` still honours the hardware; pass `--device cpu` on Apple silicon when
+  throughput matters.
 
 ### Self-play + greedy (opponent scheme)
 

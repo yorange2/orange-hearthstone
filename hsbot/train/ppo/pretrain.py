@@ -9,6 +9,8 @@ Phase 3 — save: the pre-trained model is a strong starting point for PPO fine-
 from __future__ import annotations
 import argparse, time
 
+from device import resolve_device, CHOICES as DEVICE_CHOICES  # before torch: sets MPS fallback
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -108,8 +110,8 @@ def main():
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--size", type=str, default="small",
                     choices=["small", "medium", "large", "xl"])
-    ap.add_argument("--device", type=str, default="auto",
-                    choices=["auto", "cpu", "mps"])
+    ap.add_argument("--device", type=str, default="auto", choices=DEVICE_CHOICES,
+                    help="compute device (auto = cuda > mps > cpu)")
     ap.add_argument("--out", type=str, default="pretrained.pt")
     ap.add_argument("--fixed-deck", action="store_true")
     ap.add_argument("--seed", type=int, default=42)
@@ -119,6 +121,7 @@ def main():
 
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
+    device = resolve_device(args.device)  # resolved up front so a bad device fails before phase 1
 
     # Phase 1: generate data
     print(f"Phase 1: generating data ({args.games} greedy-vs-greedy games)...", flush=True)
@@ -130,10 +133,6 @@ def main():
     print(f"Generated {len(data)} training examples in {dt:.1f}s", flush=True)
 
     # Phase 2: pre-train
-    device = args.device if args.device != "auto" else "cpu"
-    if device == "mps":
-        import os; os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
-        print("note: MPS is ~10× slower than CPU for this transformer model", flush=True)
     print(f"\nPhase 2: behavioral cloning ({args.epochs} epochs, device={device})...", flush=True)
     policy = ActorCritic(size=args.size).to(device)
     params = sum(p.numel() for p in policy.parameters())

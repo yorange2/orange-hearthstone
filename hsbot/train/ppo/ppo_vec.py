@@ -18,6 +18,8 @@ import math
 import random
 import time
 
+from device import resolve_device, CHOICES as DEVICE_CHOICES  # before torch: sets MPS fallback
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -156,16 +158,7 @@ def cosine_lr(init_lr, decay_to, total_iters, current_iter):
 
 def train(args):
     args.opponent_strategies = [s.strip() for s in args.opponent_strategies.split(",")]
-    # Device selection: default to CPU. MPS is available but ~10× slower for this model
-    # (transformer nested-tensor ops aren't MPS-native; fallback adds transfer overhead).
-    if args.device == "auto":
-        device = "cpu"
-    else:
-        device = args.device
-    if device == "mps":
-        import os; os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
-        print("note: MPS is ~10× slower than CPU for this transformer model", flush=True)
-    print(f"device: {device}", flush=True)
+    device = resolve_device(args.device)
 
     # Eval runs single-threaded on one env, so don't spawn the full training pool.
     n_envs = 1 if args.eval_only else args.num_envs
@@ -225,7 +218,7 @@ def train(args):
         n = len(b["idx"])
         pol_losses, val_losses, ents = [], [], []
         for _ in range(args.epochs):
-            for mb in torch.randperm(n).split(args.minibatch):
+            for mb in torch.randperm(n, device=device).split(args.minibatch):
                 logits, v, _, _ = main(tok_t[mb], tmask_t[mb], hist_t[mb], mask_t[mb],
                                        priv_t[mb], act_t[mb], amask_t[mb])
                 dist = torch.distributions.Categorical(logits=logits)
@@ -305,9 +298,8 @@ def main():
     ap.add_argument("--eval-every", type=int, default=5)
     ap.add_argument("--eval-episodes", type=int, default=50)
     ap.add_argument("--eval-greedy-episodes", type=int, default=50)
-    ap.add_argument("--device", type=str, default="auto",
-                    choices=["auto", "cpu", "mps"],
-                    help="compute device (auto = mps > cpu)")
+    ap.add_argument("--device", type=str, default="auto", choices=DEVICE_CHOICES,
+                    help="compute device (auto = cuda > mps > cpu)")
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--out", type=str, default="ppo_policy.pt")
     ap.add_argument("--dll", type=str, default=None)
