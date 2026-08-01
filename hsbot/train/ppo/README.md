@@ -419,7 +419,7 @@ vary decks (so identity carries signal) and stop using a stats-driven heuristic 
 target. Whether the embedding earns its place under PPO is measured in the A/B/C below —
 **it does not**.
 
-### Phase 1b — Card *text* instead of card ID ✅ *(implemented; evaluated — no win-rate gain)*
+### Phase 1b — Card *text* instead of card ID ✅ *(implemented; no in-distribution gain — zero-shot untested)*
 
 The reason the ID embedding is weak is structural, not a tuning problem: it has to **learn** what
 each card does from gradients, so only cards that actually appear ever acquire meaning. 471 of
@@ -649,6 +649,23 @@ fixed         text - id   : +0.006  [-0.034, +0.046]
 distribution.** Phase 1 was ranked first in this plan as "the hard information ceiling"; it has
 now failed twice — on BC top-1 (fixed decks) and on win rate (varied decks) — and the text
 variant, which removes the ID embedding's coverage problem entirely, did no better.
+
+> **Scope: this says nothing about zero-shot, which is what card text is *for*.** Every arm here
+> trained and evaluated on the same card pool — `variedmirror` draws from Mage/Hunter/Warrior/
+> Paladin, and across ~245k transitions the policy sees essentially every card it is later scored
+> on. Even the `fixed` eval is cross-*deck-mode*, not cross-*card*: Mage cards were in training.
+> So the property the text embedding exists to provide — a usable representation for cards that
+> **never appeared in training** — is untested here, not refuted. That property is also the one
+> the deployment path depends on (fixed mirror → the real deck the live bot plays), where most
+> cards are new and an ID embedding necessarily reads random vectors. Read this result as "card
+> identity does not help *in-distribution* at this budget", and keep `--card-text` on that basis:
+> its cost is +2,064 trainable params, and it is the only one of the three arms whose behaviour
+> on an unseen card is defined at all.
+>
+> The test that would settle it: partition the card pool, build training decks only from side A
+> and eval decks only from side B, and compare `text` against `id` and `blind`. `id` and `blind`
+> should degrade to guessing on B by construction; `text` should not. Until that runs, neither
+> the case for nor the case against card text is closed.
 
 **The finding worth keeping is the transfer failure.** On varied decks the BC stage separated
 cleanly and in the predicted order:
