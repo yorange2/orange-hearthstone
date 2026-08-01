@@ -328,8 +328,8 @@ and implicitly knows what every card does.
 - `env.py`: parse it into `Obs`
 - `ppo.py`: `nn.Embedding(vocab, 32)` concatenated into the token before `EntityEncoder`
 - Open question to settle first: SabberStone's card-ID space, and whether to embed all
-  collectibles or hash into a fixed vocab. Under `--fixed-deck` it is ~30 unique cards — start
-  there, widen later.
+  collectibles or hash into a fixed vocab. (This said "~30 unique cards under `--fixed-deck`";
+  that was wrong — see the correction below. It is ~471.)
 
 **As built.** `CardVocab` assigns dense indices by sorting card `Id` strings ordinally — every
 env process must agree on the mapping or tokens from different envs mean different things, and
@@ -375,8 +375,10 @@ already contain the seeds of:
    whether card identity helps copy a card-blind-ish teacher, not whether it helps *play*.
 2. **Almost none of the embedding trains.** Only 471 of 8303 rows ever appear, so ~7.5k of the
    ~134k nominal params get a gradient — spread over 8 epochs of one fixed Mage mirror.
-3. **A fixed mirror is the worst case for it.** Both players draw from the same 30 cards, so
-   card identity is nearly constant across the matchup it was measured on.
+3. ~~**A fixed mirror is the worst case for it.** Both players draw from the same 30 cards, so
+   card identity is nearly constant across the matchup it was measured on.~~ **Retracted — this
+   was false**, see [What `--fixed-deck` actually does](#what---fixed-deck-actually-does). Card
+   identity varied all along, which makes reasons 1 and 2 carry the whole explanation.
 
 **Consequence for the plan.** Phase 1 was ranked first as "the hard information ceiling," and
 this does not refute that for *play* — but it does mean the cheap gate cannot confirm it, and
@@ -442,19 +444,65 @@ shifts every later row and nothing crashes. The env additionally reports a `card
 id list (matching C# and Python implementations), recorded in the artifact and re-checked at
 load; both that and the vocab-size check are verified to reject a mismatched pairing.
 
+### What `--fixed-deck` actually does
+
+**`--fixed-deck` never fixed the deck.** This invalidates a premise several notes above were
+written on, including one in the Phase 1 post-mortem, so it is recorded here rather than quietly
+patched.
+
+`GameConfig.FillDecksPredictably` does **not** mean "same deck every game". It only passes
+`GameConfig.UnPredictableCardIDs` — Prince Malchezaar, Patches, the Quests — as an **exclusion
+list**, and `DeckZone.Fill` (`SabberStoneCore/src/Model/Zones/DeckZone.cs:87`) then picks the 30
+cards *at random* from the class pool, independently for each player. So under `--fixed-deck`:
+
+- deck **contents differ every game**, not just draw order;
+- the two players get **different decks**, so the "mirror" is a mirror of *class*, not of cards;
+- only the class (one pool instead of nine) and the random-effect exclusions are actually pinned.
+
+Measured, by counting distinct cards observed in play:
+
+| mode | 10 games | 30 games | 60 games |
+| --- | --- | --- | --- |
+| `fixed` | 199 | 407 | **530** |
+| `variedmirror` | 191 | 379 | 509 |
+
+A genuinely fixed 30-card deck could never exceed 30. The count is still climbing at 60 games.
+
+The repo already contained the contradiction: Phase 1 says "~30 unique cards under
+`--fixed-deck`" in one place and "only 471 distinct cards actually appear in fixed-deck play" a
+few paragraphs later. **471 was the correct one**, and it is what a random fill from the Mage +
+neutral Standard pool looks like.
+
+**What this changes.** Two things get *worse* and one gets *better*:
+
+1. The Phase 1 post-mortem's third reason — "a fixed mirror is the worst case, both players draw
+   from the same 30 cards" — is retracted. Card identity varied all along, so reasons 1 and 2
+   (the imitation target does not use card text; almost no embedding rows receive gradients)
+   carry the entire explanation of why the gate failed.
+2. `--fixed-deck` is a weaker variance control than claimed, because independent per-player fills
+   put **deck asymmetry inside the baseline** — the exact noise `variedmirror` was built to
+   remove. The 0.578 reference is still sound (seeds held out, symmetric in expectation), but its
+   "low variance" billing was overstated.
+3. Conversely the card-text case is *stronger* than argued: the setting always had ~471 distinct
+   cards in play, so there was real card variety for a semantic embedding to exploit, and the
+   "nothing unseen to generalise to" objection does not apply.
+
 ### Phase 1c — Varied decks ✅ *(implemented; not yet evaluated)*
 
-Card semantics cannot pay off in a setting with no unseen cards, so `--deck` adds modes:
+`--deck` adds modes. The motivation is no longer "add card variety" (there already was some) but
+**a fair mirror and a wider pool**:
 
 | mode | decks | why |
 | --- | --- | --- |
-| `fixed` | Mage mirror, deterministic fill | the historical baseline; lowest variance |
+| `fixed` | Mage mirror, **random** fill per player (misleading name) | the historical baseline |
 | `variedmirror` | random class, random legal 30, **identical for both seats** | card pool varies, matchup stays fair |
 | `random` | random classes, independent random fill | maximum variety, but deck-quality asymmetry becomes noise |
 
-`variedmirror` is the one to measure card embeddings on. Letting `FillDecks` run wild (`random`)
-means one side routinely draws a materially stronger pile, so win rate starts measuring deck luck
-on top of policy strength — fatal when the effect being chased is a few points wide. Decks are
+`variedmirror` is the one to measure card embeddings on, and it is the only mode of the three
+where both seats hold the **same** cards — `fixed` and `random` both fill each player's deck
+independently, so one side routinely draws a materially stronger pile and win rate measures deck
+luck on top of policy strength. That is fatal when the effect being chased is a few points wide.
+Decks are
 drawn from **implemented** Standard cards only (`Card.Implemented`); without that filter a random
 deck eventually draws a card whose effect is unwritten and throws mid-game, which would surface
 as sporadic crashes on a fraction of games rather than an obvious failure.

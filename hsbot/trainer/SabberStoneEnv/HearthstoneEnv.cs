@@ -38,10 +38,12 @@ public sealed class HearthstoneEnv
     /// <summary>How each game's decks are chosen.</summary>
     public enum DeckMode
     {
-        /// <summary>Mage mirror with a deterministic 30-card fill; only draw order varies. Lowest
-        /// variance, and the setting every number in the README so far was measured on. Also the
-        /// setting in which card identity is worth least: both players draw from the same 30
-        /// cards, so there is nothing unseen to generalise to.</summary>
+        /// <summary>Mage mirror: both heroes are MAGE and SabberStone fills each deck itself,
+        /// excluding cards with unpredictable effects. **Not a fixed 30-card list** — despite the
+        /// name, `DeckZone.Fill` chooses randomly from the class pool, so contents differ every
+        /// game *and* between the two players. What is actually pinned is the class (one pool
+        /// instead of nine) and the exclusion of random-effect cards. Every number in the README
+        /// up to the card-text work was measured here.</summary>
         Fixed,
         /// <summary>Random class, random legal 30-card deck, **identical for both players**. The
         /// card pool varies game to game (so card semantics matter) while the matchup stays fair
@@ -127,8 +129,10 @@ public sealed class HearthstoneEnv
         }
         else
         {
-            // Fixed: a Mage mirror with a deterministic 30-card fill (only draw order varies) —
-            // big variance reduction vs random classes + random fill.
+            // Mage mirror. Note FillDecksPredictably does NOT fix the deck: it only passes
+            // GameConfig.UnPredictableCardIDs as an *exclusion* list, and DeckZone.Fill still
+            // draws the 30 cards at random from the class pool, independently per player. The
+            // variance reduction is from pinning the class, not from a constant deck.
             p1 = _deckMode == DeckMode.Fixed ? CardClass.MAGE : Classes[_rnd.Next(Classes.Length)];
             p2 = _deckMode == DeckMode.Fixed ? CardClass.MAGE : Classes[_rnd.Next(Classes.Length)];
         }
