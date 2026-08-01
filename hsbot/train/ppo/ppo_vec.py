@@ -25,7 +25,7 @@ import torch
 import torch.nn as nn
 
 from env import SabberEnv, VecEnv, TOKEN_DIM, ACT_DIM
-from ppo import ActorCritic, gae, pad, evaluate, wilson_ci
+from ppo import ActorCritic, gae, pad, pad_ids, evaluate, wilson_ci, OPPONENT_STRATEGIES
 
 
 @torch.no_grad()
@@ -33,12 +33,13 @@ def batched_act(policy, obs_list, hc_list, device="cpu"):
     """Batched recurrent step over a list of decision points. Returns (idxs, logprobs, values,
     new_states) with one entry per input."""
     tok, tmask = pad([o.tokens for o in obs_list], TOKEN_DIM)
+    cid = pad_ids([o.card_ids for o in obs_list], tok.shape[1])
     act_t, amask = pad([o.actions for o in obs_list], ACT_DIM)
     priv = torch.from_numpy(np.asarray([o.priv for o in obs_list], np.float32))
     hin = torch.cat([hc[0] for hc in hc_list], 0)
     cin = torch.cat([hc[1] for hc in hc_list], 0)
     logits, v, h, c = policy(tok.to(device), tmask.to(device), hin.to(device), cin.to(device),
-                              priv.to(device), act_t.to(device), amask.to(device))
+                              priv.to(device), act_t.to(device), amask.to(device), cid.to(device))
     dist = torch.distributions.Categorical(logits=logits)
     idx = dist.sample()
     lp = dist.log_prob(idx)
@@ -47,7 +48,7 @@ def batched_act(policy, obs_list, hc_list, device="cpu"):
 
 
 def _blank_traj():
-    return {k: [] for k in ("tok", "prv", "act", "idx", "lp", "v", "r", "d", "hin", "cin", "phi")}
+    return {k: [] for k in ("tok", "cid", "prv", "act", "idx", "lp", "v", "r", "d", "hin", "cin", "phi")}
 
 
 def collect_vec(vec, main, greedy_prob, steps, gamma, shaping_coef, strategies, device="cpu"):
@@ -85,7 +86,8 @@ def collect_vec(vec, main, greedy_prob, steps, gamma, shaping_coef, strategies, 
             idxs, lps, vs, nhc = batched_act(main, [cur[i] for i in main_ids], [mh[i] for i in main_ids], device)
             for k, i in enumerate(main_ids):
                 t = T[i]
-                t["tok"].append(cur[i].tokens); t["prv"].append(cur[i].priv); t["act"].append(cur[i].actions)
+                t["tok"].append(cur[i].tokens); t["cid"].append(cur[i].card_ids)
+                t["prv"].append(cur[i].priv); t["act"].append(cur[i].actions)
                 t["idx"].append(idxs[k]); t["lp"].append(lps[k]); t["v"].append(vs[k])
                 t["r"].append(0.0); t["d"].append(0.0)
                 t["hin"].append(mh[i][0].squeeze(0).numpy()); t["cin"].append(mh[i][1].squeeze(0).numpy())
@@ -128,7 +130,7 @@ def collect_vec(vec, main, greedy_prob, steps, gamma, shaping_coef, strategies, 
                 last[i] = None
 
     # ---- per-env shaping + GAE, then concatenate for the update ----
-    tok_all, prv_all, act_all, idx_all, lp_all, hin_all, cin_all = ([] for _ in range(7))
+    tok_all, cid_all, prv_all, act_all, idx_all, lp_all, hin_all, cin_all = ([] for _ in range(8))
     adv_all, ret_all = [], []
     for i in range(N):
         t = T[i]
@@ -142,22 +144,23 @@ def collect_vec(vec, main, greedy_prob, steps, gamma, shaping_coef, strategies, 
                 r[u] += shaping_coef * (gamma * next_phi - t["phi"][u])
         adv, ret = gae(r, t["v"], t["d"], 0.0, gamma)  # trailing incomplete episode bootstraps 0
         adv_all.append(adv); ret_all.append(ret)
-        tok_all += t["tok"]; prv_all += t["prv"]; act_all += t["act"]
+        tok_all += t["tok"]; cid_all += t["cid"]; prv_all += t["prv"]; act_all += t["act"]
         idx_all += t["idx"]; lp_all += t["lp"]; hin_all += t["hin"]; cin_all += t["cin"]
 
-    batch = dict(tok=tok_all, prv=prv_all, act=act_all, idx=idx_all, lp=lp_all,
+    batch = dict(tok=tok_all, cid=cid_all, prv=prv_all, act=act_all, idx=idx_all, lp=lp_all,
                  hin=hin_all, cin=cin_all, adv=np.concatenate(adv_all), ret=np.concatenate(ret_all))
     return batch, ep_returns
 
 
-def run_eval(env, policy, episodes, opponent, eval_seed, argmax=True):
+def run_eval(env, policy, episodes, opponent, eval_seed, argmax=True, lookahead=False):
     """One benchmark: returns (rate, lo, hi) with a Wilson 95% interval.
 
     Every RNG evaluation touches is rebuilt from `eval_seed` on each call — the local `rng`
     (seat + random opponent) and torch's global RNG (used by `dist.sample()` when argmax is
     off) — so the reported rate moves only when the policy does, not when the draw changes."""
     torch.manual_seed(eval_seed)
-    wins, n = evaluate(env, policy, episodes, opponent, rng=random.Random(eval_seed), argmax=argmax)
+    wins, n = evaluate(env, policy, episodes, opponent, rng=random.Random(eval_seed),
+                       argmax=argmax, lookahead=lookahead)
     lo, hi = wilson_ci(wins, n)
     return wins / max(n, 1), lo, hi
 
@@ -166,14 +169,26 @@ def fmt_eval(rate, lo, hi):
     return f"{rate:.3f} [{lo:.3f}-{hi:.3f}]"
 
 
-def cosine_lr(init_lr, decay_to, total_iters, current_iter):
-    """Cosine annealing: decays from init_lr to decay_to over total_iters."""
-    progress = min(current_iter / max(total_iters, 1), 1.0)
+def cosine_lr(init_lr, decay_to, total_iters, current_iter, warmup_iters=0):
+    """Linear warmup then cosine annealing from init_lr down to decay_to.
+
+    Warmup matters for the large presets: `100x` collapsed into a degenerate solution at
+    lr=1e-3 with no warmup (BC loss flat from epoch 2), which is why its scaling result could
+    not be read as a capacity result. Big transformers need the first few hundred steps at a
+    small LR before the full rate is safe."""
+    if warmup_iters > 0 and current_iter <= warmup_iters:
+        return init_lr * current_iter / warmup_iters
+    progress = min((current_iter - warmup_iters) / max(total_iters - warmup_iters, 1), 1.0)
     return decay_to + 0.5 * (init_lr - decay_to) * (1.0 + math.cos(math.pi * progress))
 
 
 def train(args):
-    args.opponent_strategies = [s.strip() for s in args.opponent_strategies.split(",")]
+    # "all" expands to every SabberStone heuristic (Phase 5: opponent diversity). Training
+    # against one opponent risks learning a single exploit rather than general play.
+    if args.opponent_strategies.strip() == "all":
+        args.opponent_strategies = list(OPPONENT_STRATEGIES)
+    else:
+        args.opponent_strategies = [s.strip() for s in args.opponent_strategies.split(",")]
     device = resolve_device(args.device)
 
     if args.eval_seed in range(args.seed, args.seed + args.num_envs):
@@ -184,8 +199,13 @@ def train(args):
     # env: those have had their RNG stream advanced by rollouts, so eval games were previously
     # neither held out nor reproducible.
     eval_env = SabberEnv(seed=args.eval_seed, fixed_deck=args.fixed_deck,
-                         dll=args.dll, dotnet=args.dotnet)
-    main = ActorCritic(size=args.size).to(device)
+                         dll=args.dll, dotnet=args.dotnet, potential=args.potential)
+    # Vocab comes from the env, not a constant: the embedding must match the indices the env
+    # actually emits, and a checkpoint is only loadable into a model built with the same vocab.
+    card_vocab = 0 if args.no_card_emb else eval_env.card_vocab()
+    main = ActorCritic(size=args.size, card_vocab=card_vocab, card_dim=args.card_dim).to(device)
+    print(f"card embedding: vocab={card_vocab} dim={args.card_dim if card_vocab else 0}  "
+          f"params={sum(p.numel() for p in main.parameters()):,}", flush=True)
     if args.resume or args.eval_only:
         ckpt = args.resume or args.eval_only
         state = torch.load(ckpt, map_location="cpu", weights_only=True)
@@ -193,15 +213,15 @@ def train(args):
         print(f"loaded checkpoint from {ckpt}", flush=True)
 
     if args.eval_only:
-        r = run_eval(eval_env, main, args.eval_episodes, "random", args.eval_seed, not args.eval_sample)
-        g = run_eval(eval_env, main, args.eval_greedy_episodes, "greedy", args.eval_seed, not args.eval_sample)
+        r = run_eval(eval_env, main, args.eval_episodes, "random", args.eval_seed, not args.eval_sample, args.lookahead)
+        g = run_eval(eval_env, main, args.eval_greedy_episodes, "greedy", args.eval_seed, not args.eval_sample, args.lookahead)
         print(f"vs random {fmt_eval(*r)}  |  vs greedy {fmt_eval(*g)}"
               f"   (eval-seed {args.eval_seed}, n={args.eval_episodes}/{args.eval_greedy_episodes})")
         eval_env.close()
         return
 
     vec = VecEnv(args.num_envs, seed0=args.seed, fixed_deck=args.fixed_deck,
-                 dll=args.dll, dotnet=args.dotnet)
+                 dll=args.dll, dotnet=args.dotnet, potential=args.potential)
 
     opt = torch.optim.Adam(main.parameters(), lr=args.lr)
 
@@ -210,13 +230,19 @@ def train(args):
 
     for it in range(1, args.iters + 1):
         # ---- LR schedule (cosine annealing) ----
-        current_lr = cosine_lr(args.lr, args.lr * args.lr_decay, args.iters, it)
+        current_lr = cosine_lr(args.lr, args.lr * args.lr_decay, args.iters, it, args.warmup_iters)
         for pg in opt.param_groups:
             pg["lr"] = current_lr
 
         # ---- Entropy schedule (linear decay) ----
         progress = (it - 1) / max(args.iters - 1, 1)
         ent_coef = args.ent_start + (args.ent_end - args.ent_start) * progress
+
+        # ---- Shaping schedule (linear decay) ----
+        # Phase 2: the potential is greedy's own objective, so a constant coefficient anchors the
+        # final policy at heuristic level. Annealing to --shaping-end lets shaping bootstrap early
+        # learning, then hands the policy back to the terminal win/loss signal.
+        shaping_coef = args.shaping_coef + (args.shaping_end - args.shaping_coef) * progress
 
         # ---- Progressive curriculum: ramp greedy-prob over first part of training ----
         if args.greedy_end > args.greedy_start:
@@ -226,11 +252,12 @@ def train(args):
             greedy_prob = args.greedy_prob
 
         t0 = time.time()
-        b, ep = collect_vec(vec, main, greedy_prob, args.steps, args.gamma, args.shaping_coef,
+        b, ep = collect_vec(vec, main, greedy_prob, args.steps, args.gamma, shaping_coef,
                            args.opponent_strategies, device)
         sps = len(b["idx"]) / max(time.time() - t0, 1e-9)
 
         tok_t, tmask_t = (t.to(device) for t in pad(b["tok"], TOKEN_DIM))
+        cid_t = pad_ids(b["cid"], tok_t.shape[1]).to(device)
         act_t, amask_t = (t.to(device) for t in pad(b["act"], ACT_DIM))
         priv_t = torch.from_numpy(np.asarray(b["prv"], np.float32)).to(device)
         hist_t = torch.from_numpy(np.asarray(b["hin"], np.float32)).to(device)
@@ -246,7 +273,7 @@ def train(args):
         for _ in range(args.epochs):
             for mb in torch.randperm(n, device=device).split(args.minibatch):
                 logits, v, _, _ = main(tok_t[mb], tmask_t[mb], hist_t[mb], mask_t[mb],
-                                       priv_t[mb], act_t[mb], amask_t[mb])
+                                       priv_t[mb], act_t[mb], amask_t[mb], cid_t[mb])
                 dist = torch.distributions.Categorical(logits=logits)
                 ratio = torch.exp(dist.log_prob(idx_t[mb]) - oldlp_t[mb])
                 surr1 = ratio * adv_t[mb]
@@ -267,11 +294,11 @@ def train(args):
         avg_ent = float(np.mean(ents))
         line = (f"iter {it:3d}  envs {args.num_envs}  transitions {n:5d}  {sps:6.0f} steps/s  "
                 f"episodes {len(ep):3d}  train_wr {tr_wr:.3f}  "
-                f"lr {current_lr:.1e}  ent_coef {ent_coef:.4f}  "
+                f"lr {current_lr:.1e}  ent_coef {ent_coef:.4f}  shp {shaping_coef:.3f}  "
                 f"pol {avg_pol:.3f}  val {avg_val:.3f}  ent {avg_ent:.3f}")
         if it % args.eval_every == 0:
-            r = run_eval(eval_env, main, args.eval_episodes, "random", args.eval_seed, not args.eval_sample)
-            g = run_eval(eval_env, main, args.eval_greedy_episodes, "greedy", args.eval_seed, not args.eval_sample)
+            r = run_eval(eval_env, main, args.eval_episodes, "random", args.eval_seed, not args.eval_sample, args.lookahead)
+            g = run_eval(eval_env, main, args.eval_greedy_episodes, "greedy", args.eval_seed, not args.eval_sample, args.lookahead)
             wr_g = g[0]
             line += f"  [vs random {fmt_eval(*r)} | vs greedy {fmt_eval(*g)}]"
             # Track best model by vs-greedy win rate. Taking a max over repeated noisy evals
@@ -301,6 +328,9 @@ def main():
     ap.add_argument("--epochs", type=int, default=4)
     ap.add_argument("--minibatch", type=int, default=512)
     ap.add_argument("--lr", type=float, default=3e-4)
+    ap.add_argument("--warmup-iters", type=int, default=0,
+                    help="linear LR warmup over the first N iters (Phase 4). Recommended for "
+                         "large/xl/100x, which diverge or collapse without it")
     ap.add_argument("--lr-decay", type=float, default=0.1,
                     help="cosine-anneal LR to lr*lr_decay over training")
     ap.add_argument("--gamma", type=float, default=1.0)
@@ -310,7 +340,15 @@ def main():
                     help="entropy bonus at start (decays linearly to --ent-end)")
     ap.add_argument("--ent-end", type=float, default=0.002,
                     help="entropy bonus at end of training")
-    ap.add_argument("--shaping-coef", type=float, default=0.05)
+    ap.add_argument("--shaping-coef", type=float, default=0.05,
+                    help="potential-based shaping coefficient at the START of training")
+    ap.add_argument("--shaping-end", type=float, default=0.05,
+                    help="shaping coefficient at the END (linear anneal from --shaping-coef; "
+                         "set 0 to hand the policy back to the pure win/loss signal)")
+    ap.add_argument("--potential", type=str, default="midrange",
+                    choices=["midrange", "board", "none"],
+                    help="shaping potential: midrange = greedy's own score function (anchors the "
+                         "policy to greedy), board = health+material differential, none = 0")
     ap.add_argument("--greedy-prob", type=float, default=0.7,
                     help="prob. opponent is the greedy heuristic (constant; overridden by curriculum)")
     ap.add_argument("--greedy-start", type=float, default=0.3,
@@ -320,7 +358,8 @@ def main():
     ap.add_argument("--curriculum-frac", type=float, default=0.5,
                     help="fraction of training over which greedy prob ramps (0.5 = first half)")
     ap.add_argument("--opponent-strategies", type=str, default="midrange",
-                    help="comma-separated greedy opponent strategies (midrange,aggro,control,fatigue,ramp)")
+                    help="comma-separated greedy opponent strategies, or 'all' for every "
+                         "heuristic (midrange,aggro,control,fatigue,ramp)")
     ap.add_argument("--size", type=str, default="small",
                     choices=["small", "medium", "large", "xl", "100x"],
                     help="model scale: small (173k), medium (532k), large (1.2M), xl (1.7M), "
@@ -338,6 +377,14 @@ def main():
     ap.add_argument("--eval-seed", type=int, default=100000,
                     help="seed for the dedicated eval env + eval RNG; must not overlap the "
                          "training seeds (--seed .. --seed+--num-envs-1) or eval is not held out")
+    ap.add_argument("--card-dim", type=int, default=16,
+                    help="card-identity embedding width (Phase 1)")
+    ap.add_argument("--no-card-emb", action="store_true",
+                    help="ablation: disable the card embedding, restoring the card-blind "
+                         "18-float-only observation")
+    ap.add_argument("--lookahead", action="store_true",
+                    help="Phase 3: evaluate with critic-scored one-ply lookahead, matching the "
+                         "search depth greedy already has. Costs N engine clones per decision")
     ap.add_argument("--eval-sample", action="store_true",
                     help="sample eval actions instead of taking argmax. Adds large variance "
                          "(13-point swings between identical runs); argmax is the default")

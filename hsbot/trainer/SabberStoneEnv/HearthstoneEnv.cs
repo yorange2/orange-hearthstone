@@ -33,6 +33,23 @@ public sealed class HearthstoneEnv
     private readonly bool _fixedDeck;
     private const int MaxDecisions = 800; // safety cap; HS games terminate via fatigue anyway
     private const double PotentialScale = 200.0;
+    private const double BoardPotentialScale = 60.0;
+
+    /// <summary>Which board-state function to use as the shaping potential Φ.</summary>
+    public enum PotentialMode
+    {
+        /// <summary>tanh(MidRangeScore/200) — the greedy opponent's *own* objective. Shaping with
+        /// it rewards the agent for maximizing exactly what the heuristic maximizes, which anchors
+        /// the policy at heuristic-level play.</summary>
+        MidRange,
+        /// <summary>Hand-rolled health + board-material differential. Correlated with MidRange (any
+        /// sane board eval is) but not identical to greedy's objective.</summary>
+        Board,
+        /// <summary>No shaping signal; Φ ≡ 0. Isolates the terminal ±1 reward.</summary>
+        None,
+    }
+
+    private readonly PotentialMode _potentialMode;
 
     // MidRangeScore reused as the shaping potential Φ (same heuristic the greedy opponent uses).
     private readonly SabberStoneBasicAI.Score.Score _potentialScorer = new SabberStoneBasicAI.Score.MidRangeScore();
@@ -42,14 +59,18 @@ public sealed class HearthstoneEnv
     private List<SabberStoneCore.Tasks.PlayerTasks.PlayerTask> _legal = new();
     private int _decisions;
 
-    public HearthstoneEnv(int seed, bool fixedDeck = false)
+    public HearthstoneEnv(int seed, bool fixedDeck = false, PotentialMode potential = PotentialMode.MidRange)
     {
         _rnd = new Random(seed);
         _fixedDeck = fixedDeck;
+        _potentialMode = potential;
     }
 
     /// <summary>Entity tokens for the current decision point: [numTokens, TokenDim].</summary>
     public float[][] Tokens { get; private set; } = System.Array.Empty<float[]>();
+
+    /// <summary>CardVocab index per token, parallel to <see cref="Tokens"/>: [numTokens].</summary>
+    public int[] CardIds { get; private set; } = System.Array.Empty<int>();
 
     /// <summary>Legal-action features: [numActions, ActDim].</summary>
     public float[][] LegalActionFeatures { get; private set; } = System.Array.Empty<float[]>();
@@ -136,6 +157,68 @@ public sealed class HearthstoneEnv
         return Step(GreedyActionIndex);
     }
 
+    /// <summary>One resulting state per legal action, for critic-scored one-ply lookahead.</summary>
+    public sealed class SimState
+    {
+        public float[][] Tokens { get; set; } = System.Array.Empty<float[]>();
+        public int[] CardIds { get; set; } = System.Array.Empty<int>();
+        public float[] Priv { get; set; } = System.Array.Empty<float>();
+        public bool Terminal { get; set; }
+        /// <summary>True when the resulting state's player-to-move is still the acting player.
+        /// When false the critic's value is from the opponent's view and must be negated.</summary>
+        public bool Mine { get; set; }
+        /// <summary>+1/-1/0 from the acting player's perspective when Terminal.</summary>
+        public int Outcome { get; set; }
+    }
+
+    /// <summary>
+    /// Phase 3: clone-and-apply each legal action, returning the resulting state encoded from the
+    /// *current mover's* perspective. This is the same one-ply lookahead the greedy heuristic
+    /// gets; the difference is that the caller scores the results with the learned critic instead
+    /// of a handcrafted board score.
+    ///
+    /// Clones inherit the parent RNG stream (resetRandomSeed: false) so every option is evaluated
+    /// under the same draw and the comparison stays deterministic.
+    /// </summary>
+    public SimState[] SimulateAll()
+    {
+        int actingPid = _game.CurrentPlayer.PlayerId;
+        var outp = new SimState[_legal.Count];
+        for (int i = 0; i < _legal.Count; i++)
+        {
+            Game clone = _game.Clone(resetRandomSeed: false);
+            var opts = clone.CurrentPlayer.Options();
+            if (i >= opts.Count) { outp[i] = new SimState(); continue; }
+            clone.Process(opts[i]);
+
+            if (clone.State == State.COMPLETE)
+            {
+                int winner = clone.Player1.PlayState == PlayState.WON ? 1
+                           : clone.Player2.PlayState == PlayState.WON ? 2 : 0;
+                outp[i] = new SimState
+                {
+                    Terminal = true,
+                    Outcome = winner == 0 ? 0 : (winner == actingPid ? 1 : -1),
+                };
+                continue;
+            }
+
+            // Encode from the player *to move*, which is the only perspective the critic was ever
+            // trained on. Encoding from the acting player's view after the turn flips is
+            // out-of-distribution and the value estimate becomes meaningless (measured: it drove
+            // win rate from 0.667 to 0.067). `Mine` tells the caller whether to negate — the
+            // standard negamax convention.
+            Controller mover = clone.CurrentPlayer;
+            var (tok, ids) = TokenEncoder.Encode(clone, mover);
+            outp[i] = new SimState
+            {
+                Tokens = tok, CardIds = ids, Priv = PrivilegedEncoder.Encode(mover.Opponent),
+                Mine = mover.PlayerId == actingPid,
+            };
+        }
+        return outp;
+    }
+
     private void Observe()
     {
         Controller me = _game.CurrentPlayer;
@@ -146,9 +229,34 @@ public sealed class HearthstoneEnv
             feats[i] = ActionEncoder.Encode(_legal[i], me);
         LegalActionFeatures = feats;
         Privileged = PrivilegedEncoder.Encode(_game.CurrentOpponent);
-        Tokens = TokenEncoder.Encode(_game);
+        (Tokens, CardIds) = TokenEncoder.Encode(_game);
         Flat = SabberStoneGen.FeatureExtractor.Extract(_observer.Observe(_game));
-        _potentialScorer.Controller = me;
-        Potential = (float)System.Math.Tanh(_potentialScorer.Rate() / PotentialScale);
+        Potential = ComputePotential(me);
+    }
+
+    /// <summary>Shaping potential Φ ∈ [-1,1] for the given controller, per <see cref="PotentialMode"/>.</summary>
+    private float ComputePotential(Controller me)
+    {
+        switch (_potentialMode)
+        {
+            case PotentialMode.None:
+                return 0f;
+
+            case PotentialMode.Board:
+            {
+                // Health/armor differential plus board material (attack + health of minions),
+                // deliberately NOT routed through any SabberStoneBasicAI scorer.
+                Controller opp = me.Opponent;
+                int hp = (me.Hero.Health + me.Hero.Armor) - (opp.Hero.Health + opp.Hero.Armor);
+                int material = 0;
+                foreach (Minion m in me.BoardZone) material += m.AttackDamage + m.Health;
+                foreach (Minion m in opp.BoardZone) material -= m.AttackDamage + m.Health;
+                return (float)System.Math.Tanh((hp + 2 * material) / BoardPotentialScale);
+            }
+
+            default:
+                _potentialScorer.Controller = me;
+                return (float)System.Math.Tanh(_potentialScorer.Rate() / PotentialScale);
+        }
     }
 }

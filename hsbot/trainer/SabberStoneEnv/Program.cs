@@ -10,7 +10,11 @@ using SabberStoneEnv;
 
 int seed = args.Length > 0 ? int.Parse(args[0]) : 1;
 bool fixedDeck = args.Length > 1 && args[1] == "1";
-var env = new HearthstoneEnv(seed, fixedDeck);
+// args[2]: shaping-potential mode ("midrange" default | "board" | "none") — see PotentialMode.
+var potential = args.Length > 2
+    ? System.Enum.Parse<HearthstoneEnv.PotentialMode>(args[2], ignoreCase: true)
+    : HearthstoneEnv.PotentialMode.MidRange;
+var env = new HearthstoneEnv(seed, fixedDeck, potential);
 var jsonOpts = new JsonSerializerOptions
 {
     PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
@@ -43,6 +47,20 @@ while ((line = Console.In.ReadLine()) != null)
         bool done = env.Step(idx);
         Write(env, done);
     }
+    else if (line == "simulate")
+    {
+        // Phase 3: resulting state per legal action, for critic-scored one-ply lookahead.
+        // Read-only w.r.t. the live game — it clones.
+        stdout.WriteLine(JsonSerializer.Serialize(new SimResponse { States = env.SimulateAll() }, jsonOpts));
+        stdout.Flush();
+    }
+    else if (line == "meta")
+    {
+        // Static env facts the Python side needs before building the model — currently the
+        // card-embedding vocabulary size. Queried once at startup, so it must not touch game state.
+        stdout.WriteLine(JsonSerializer.Serialize(new Meta { CardVocab = CardVocab.Count }, jsonOpts));
+        stdout.Flush();
+    }
     else if (line == "close")
     {
         break;
@@ -53,7 +71,8 @@ void Write(HearthstoneEnv e, bool done)
 {
     var resp = new Response
     {
-        Tokens = e.Tokens, Flat = e.Flat, Priv = e.Privileged, Actions = e.LegalActionFeatures,
+        Tokens = e.Tokens, CardIds = e.CardIds, Flat = e.Flat, Priv = e.Privileged,
+        Actions = e.LegalActionFeatures,
         Player = e.CurrentPlayerId, Potential = e.Potential, Done = done, Winner = e.Winner,
         GreedyAction = e.GreedyActionIndex,
     };
@@ -64,6 +83,7 @@ void Write(HearthstoneEnv e, bool done)
 sealed class Response
 {
     public float[][] Tokens { get; set; } = System.Array.Empty<float[]>();
+    public int[] CardIds { get; set; } = System.Array.Empty<int>();
     public float[] Flat { get; set; } = System.Array.Empty<float>();
     public float[] Priv { get; set; } = System.Array.Empty<float>();
     public float[][] Actions { get; set; } = System.Array.Empty<float[]>();
@@ -72,4 +92,14 @@ sealed class Response
     public bool Done { get; set; }
     public int Winner { get; set; }
     public int GreedyAction { get; set; }
+}
+
+sealed class Meta
+{
+    public int CardVocab { get; set; }
+}
+
+sealed class SimResponse
+{
+    public HearthstoneEnv.SimState[] States { get; set; } = System.Array.Empty<HearthstoneEnv.SimState>();
 }

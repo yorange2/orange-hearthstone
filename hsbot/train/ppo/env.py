@@ -25,6 +25,7 @@ PRIV_DIM = 8  # opponent-hidden features, critic-only (training)
 class Obs:
     """One decision point, from the current mover's perspective."""
     tokens: np.ndarray   # [T, TOKEN_DIM]
+    card_ids: np.ndarray # [T] int64 CardVocab index per token (0 = none/unknown)
     flat: np.ndarray     # [144] flat observable features (FEATURES.md v1)
     priv: np.ndarray     # [PRIV_DIM]  (critic-only)
     actions: np.ndarray  # [N, ACT_DIM]
@@ -39,10 +40,11 @@ _DEFAULT_DLL = (
 
 
 class SabberEnv:
-    def __init__(self, seed: int = 1, fixed_deck: bool = False, dll: str | None = None, dotnet: str = "dotnet"):
+    def __init__(self, seed: int = 1, fixed_deck: bool = False, dll: str | None = None,
+                 dotnet: str = "dotnet", potential: str = "midrange"):
         dll_path = str(dll or _DEFAULT_DLL)
         self.proc = subprocess.Popen(
-            [dotnet, dll_path, str(seed), "1" if fixed_deck else "0"],
+            [dotnet, dll_path, str(seed), "1" if fixed_deck else "0", potential],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1,
         )
 
@@ -57,7 +59,9 @@ class SabberEnv:
         return np.asarray(rows, dtype=np.float32) if rows else np.zeros((0, dim), np.float32)
 
     def _obs(self, d: dict) -> "Obs":
-        return Obs(self._mat(d["tokens"], TOKEN_DIM), np.asarray(d["flat"], np.float32),
+        return Obs(self._mat(d["tokens"], TOKEN_DIM),
+                   np.asarray(d.get("cardIds", []), np.int64),
+                   np.asarray(d["flat"], np.float32),
                    np.asarray(d["priv"], np.float32),
                    self._mat(d["actions"], ACT_DIM), int(d["player"]), float(d["potential"]),
                    int(d.get("greedyAction", -1)))
@@ -76,6 +80,14 @@ class SabberEnv:
         d = json.loads(self.proc.stdout.readline())
         return self._obs(d), bool(d["done"]), int(d["winner"])
 
+    def meta(self) -> dict:
+        """Static env facts needed before the model is built (card-embedding vocab size).
+        Safe to call at startup: it does not touch game state."""
+        return self._rpc("meta")
+
+    def card_vocab(self) -> int:
+        return int(self.meta()["cardVocab"])
+
     def reset(self) -> "Obs":
         return self._obs(self._rpc("reset"))
 
@@ -89,6 +101,22 @@ class SabberEnv:
         strategy: one of midrange, aggro, control, fatigue, ramp."""
         d = self._rpc(f"step_greedy {strategy}")
         return self._obs(d), bool(d["done"]), int(d["winner"])
+
+    def simulate(self) -> list[dict]:
+        """Phase 3: resulting state per legal action (one-ply lookahead), from the current
+        mover's perspective. Each entry is {tokens, card_ids, priv, terminal, outcome}."""
+        d = self._rpc("simulate")
+        out = []
+        for st in d["states"]:
+            out.append(dict(
+                tokens=self._mat(st.get("tokens"), TOKEN_DIM),
+                card_ids=np.asarray(st.get("cardIds") or [], np.int64),
+                priv=np.asarray(st.get("priv") or [0.0] * PRIV_DIM, np.float32),
+                terminal=bool(st.get("terminal", False)),
+                mine=bool(st.get("mine", True)),
+                outcome=int(st.get("outcome", 0)),
+            ))
+        return out
 
     def close(self) -> None:
         try:
@@ -107,9 +135,12 @@ class VecEnv:
     """
 
     def __init__(self, n: int, seed0: int = 1, fixed_deck: bool = False,
-                 dll: str | None = None, dotnet: str = "dotnet"):
+                 dll: str | None = None, dotnet: str = "dotnet", potential: str = "midrange"):
         self.n = n
-        self.envs = [SabberEnv(seed0 + i, fixed_deck, dll, dotnet) for i in range(n)]
+        self.envs = [SabberEnv(seed0 + i, fixed_deck, dll, dotnet, potential) for i in range(n)]
+
+    def card_vocab(self) -> int:
+        return self.envs[0].card_vocab()
 
     def reset_all(self) -> list["Obs"]:
         for e in self.envs:
