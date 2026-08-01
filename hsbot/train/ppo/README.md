@@ -435,7 +435,7 @@ defaulted to `midrange` alone). Training against the full set should reduce over
 opponent. Note that eval is vs midrange, so this may not move the headline number even if the
 policy is genuinely better.
 
-### A/B: does the Phase 1–5 stack actually beat the baseline? *(running)*
+### A/B: does the Phase 1–5 stack actually beat the baseline? *(not run — protocol pre-registered)*
 
 The gates above are cheap proxies; this is the measurement that decides. Two arms, **identical
 recipe and seed**, differing only in the new features:
@@ -459,7 +459,11 @@ arithmetic in Phase 0, separating arms ~5 points apart needs ~1500 games each �
 inside ±3 points at n=1200 is **not resolved**, and should be reported as such rather than as a
 small win. Isolating individual phases needs one-factor-at-a-time runs after this.
 
-*Status: arm A PPO in progress; numbers land here when the run completes.*
+*Status: **not run.** Both BC stages completed (they are what produced the Phase 1 gate table
+above); the PPO arms were started and then cancelled before either finished, so there are no
+win-rate numbers for this comparison and none should be inferred. The protocol above is recorded
+as pre-registered — if this is picked up later, run it as written rather than re-deciding the
+success criterion after seeing results.*
 
 ### Not on the list
 
