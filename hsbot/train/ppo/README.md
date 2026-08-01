@@ -104,11 +104,27 @@ Measured on an M-series (10-core), same model, so the only variable is where the
 | BC / PPO update | big fixed-ish batches (256–512) | MPS ~5× faster | MPS ~2.6× faster |
 
 MPS loses the rollout at **every** model size: the ragged token/action padding means the shape
-changes on nearly every call, which defeats MPS graph caching (a few nested-tensor ops also lack
-MPS kernels and fall back to CPU). It wins clearly on large-batch training, where one shape is
-reused. So the fastest recipe on Apple silicon is **`pretrain.py --device mps`, `ppo_vec.py
---device cpu`** — about 2× faster end-to-end than using either device for both. `auto` cannot
-know this (it sees hardware, not phase), so pass `--device` explicitly when it matters.
+changes on nearly every call, which defeats MPS graph caching. It wins clearly on large-batch
+training, where one shape is reused. So the fastest recipe on Apple silicon is **`pretrain.py
+--device mps`, `ppo_vec.py --device cpu`** — about 2× faster end-to-end than using either device
+for both. `auto` cannot know this (it sees hardware, not phase), so pass `--device` explicitly
+when it matters.
+
+> **Correction — the nested-tensor explanation was wrong.** This paragraph used to add "a few
+> nested-tensor ops also lack MPS kernels and fall back to CPU". They do not fall back, because
+> they are never called: `nn.TransformerEncoder` gates its nested-tensor fast path on
+> `src.device.type in ("cpu", "cuda", privateuse1)` (torch 2.8,
+> `torch/nn/modules/transformer.py:496`), and MPS is not in that list. Counting the calls:
+> `_nested_tensor_from_mask` runs **1×** on CPU in eval and **0×** on MPS. The fast path is also
+> disabled in *training* mode on every device (`first_layer.training` is checked first), so it
+> cannot explain a train-time device gap at all. The timings in the table are unaffected — only
+> the mechanism was wrong — but two things follow: a patch "working around" the MPS fallback
+> would be a no-op, and the real cause of MPS's rollout loss is most plausibly per-call dispatch
+> overhead on small, constantly-reshaped tensors rather than anything mask-related.
+>
+> Note also that `device.py` prints its "MPS ~6× slower" warning **unconditionally**, including
+> during BC — the one phase this table says MPS *wins*. Those are in tension; the row for
+> `BC / PPO update` is being re-measured.
 
 ### Self-play + greedy (opponent scheme)
 
