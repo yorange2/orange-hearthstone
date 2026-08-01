@@ -384,6 +384,81 @@ the honest next test is the PPO arm, not another BC run. A stronger version of P
 vary decks (so identity carries signal) and stop using a stats-driven heuristic as the imitation
 target. Whether the embedding earns its place under PPO is measured in the A/B below.
 
+### Phase 1b — Card *text* instead of card ID ✅ *(implemented; not yet evaluated)*
+
+The reason the ID embedding is weak is structural, not a tuning problem: it has to **learn** what
+each card does from gradients, so only cards that actually appear ever acquire meaning. 471 of
+8303 rows train under `--fixed-deck`; the remaining 7832 stay at random init, and the policy
+reads those random vectors *silently* — an unseen card is not "unknown", it is noise that looks
+like data. That is also why the ID embedding can never help the deployment goal in the upgrade
+paths (fixed Mage mirror → the real deck the live bot plays): a new deck is mostly new rows.
+
+`card_text.py` builds a frozen `[8303, D]` matrix from each card's **name + rules text**, and the
+model projects it to `card_dim` with a small trained layer:
+
+```
+python card_text.py --out card_text_emb.npz          # once, offline
+python pretrain.py --card-text card_text_emb.npz --deck variedmirror ...
+```
+
+Meaning is *read* rather than learned, so all 8303 rows are populated before a single game is
+played and an unseen card is represented by its similarity to seen ones. The cost structure
+inverts nicely:
+
+| card identity | total params | **trainable** | added trainable | rows with meaning |
+| --- | --- | --- | --- | --- |
+| none (card-blind) | 173,122 | 173,122 | — | 0 |
+| learned id embedding | 306,994 | 306,994 | +133,872 | 471 |
+| **frozen text embedding** | 706,578 | **175,186** | **+2,064** | **8303** |
+
+**65× fewer trainable params than the ID table, for every card instead of 6% of them.** That also
+settles the capacity confound the scale study raised: this arm adds information while *reducing*
+trainable capacity relative to Phase 1, so a win cannot be attributed to size.
+
+**Encoder: TF-IDF + SVD, not a sentence transformer** (`--encoder st` switches, optional import).
+Hearthstone rules text is templated rather than prose — `<b>Battlecry:</b> Deal $3 damage.` — so
+lexical overlap genuinely is the semantics, and the vocabulary (6679 tokens over 8303 cards) is
+small enough for SVD to recover the mechanic structure. It needs no model download, no network,
+and is deterministic, which a downloaded transformer is not. Spot-checked neighbours:
+
+```
+Fireball    -> Fireblast, Roaring Torch, Dynamite, Pyroblast     (direct damage)
+Flamestrike -> Felbloom, Arcane Explosion, Swipe, Boom!          (AoE damage)
+Polymorph   -> Bananas, Polymorph, Light-imbued                  (transform)
+```
+
+**Known weakness, measured.** 1417 cards have no rules text at all (vanilla minions like Chillwind
+Yeti), so their document is just a name. Those rows partially collapse — mean pairwise cosine
+**0.492**, with 5.7% of pairs above 0.99, against **0.000** and no near-duplicates for the 6885
+cards that do have text. The mitigation is that a vanilla card's identity *is* its cost/attack/
+health, which the 18-float token already carries; the embedding is only load-bearing for cards
+whose text does something. Worth revisiting (card type / tribe / tags as extra tokens) if the
+varied-deck arms underperform.
+
+**Alignment is the failure mode to fear**, because it is silent. The matrix rows must match the
+`CardVocab` indices the env emits, so the card list is pulled *from the env* over a new `cards`
+command rather than re-parsed from `CardDefs.xml` — a one-card difference between those pools
+shifts every later row and nothing crashes. The env additionally reports a `cardIdsHash` over its
+id list (matching C# and Python implementations), recorded in the artifact and re-checked at
+load; both that and the vocab-size check are verified to reject a mismatched pairing.
+
+### Phase 1c — Varied decks ✅ *(implemented; not yet evaluated)*
+
+Card semantics cannot pay off in a setting with no unseen cards, so `--deck` adds modes:
+
+| mode | decks | why |
+| --- | --- | --- |
+| `fixed` | Mage mirror, deterministic fill | the historical baseline; lowest variance |
+| `variedmirror` | random class, random legal 30, **identical for both seats** | card pool varies, matchup stays fair |
+| `random` | random classes, independent random fill | maximum variety, but deck-quality asymmetry becomes noise |
+
+`variedmirror` is the one to measure card embeddings on. Letting `FillDecks` run wild (`random`)
+means one side routinely draws a materially stronger pile, so win rate starts measuring deck luck
+on top of policy strength — fatal when the effect being chased is a few points wide. Decks are
+drawn from **implemented** Standard cards only (`Card.Implemented`); without that filter a random
+deck eventually draws a card whose effect is unwritten and throws mid-game, which would surface
+as sporadic crashes on a fraction of games rather than an obvious failure.
+
 ### Phase 2 — Decouple the reward from greedy ✅ *(implemented)*
 
 Three anchors hold the policy at heuristic level, the strongest being that the shaping potential

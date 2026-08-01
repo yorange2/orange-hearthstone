@@ -24,7 +24,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from env import SabberEnv, VecEnv, TOKEN_DIM, ACT_DIM
+import card_text as card_text_mod
+from env import SabberEnv, VecEnv, DECK_MODES, deck_mode, TOKEN_DIM, ACT_DIM
 from ppo import ActorCritic, gae, pad, pad_ids, evaluate, wilson_ci, OPPONENT_STRATEGIES
 
 
@@ -198,14 +199,18 @@ def train(args):
     # Evaluation gets its own env process, seeded from --eval-seed. It must NOT be a training
     # env: those have had their RNG stream advanced by rollouts, so eval games were previously
     # neither held out nor reproducible.
-    eval_env = SabberEnv(seed=args.eval_seed, fixed_deck=args.fixed_deck,
+    eval_env = SabberEnv(seed=args.eval_seed, deck=deck_mode(args),
                          dll=args.dll, dotnet=args.dotnet, potential=args.potential)
     # Vocab comes from the env, not a constant: the embedding must match the indices the env
     # actually emits, and a checkpoint is only loadable into a model built with the same vocab.
-    card_vocab = 0 if args.no_card_emb else eval_env.card_vocab()
-    main = ActorCritic(size=args.size, card_vocab=card_vocab, card_dim=args.card_dim).to(device)
-    print(f"card embedding: vocab={card_vocab} dim={args.card_dim if card_vocab else 0}  "
-          f"params={sum(p.numel() for p in main.parameters()):,}", flush=True)
+    card_vocab, card_text = card_text_mod.resolve(args.card_text, eval_env.card_vocab(),
+                                                  args.no_card_emb, eval_env.card_ids_hash())
+    main = ActorCritic(size=args.size, card_vocab=card_vocab, card_dim=args.card_dim,
+                       card_text=card_text).to(device)
+    total = sum(p.numel() for p in main.parameters())
+    trainable = sum(p.numel() for p in main.parameters() if p.requires_grad)
+    print(card_text_mod.describe(card_vocab, card_text, args.card_dim), flush=True)
+    print(f"params={total:,} trainable={trainable:,}", flush=True)
     if args.resume or args.eval_only:
         ckpt = args.resume or args.eval_only
         state = torch.load(ckpt, map_location="cpu", weights_only=True)
@@ -220,7 +225,7 @@ def train(args):
         eval_env.close()
         return
 
-    vec = VecEnv(args.num_envs, seed0=args.seed, fixed_deck=args.fixed_deck,
+    vec = VecEnv(args.num_envs, seed0=args.seed, deck=deck_mode(args),
                  dll=args.dll, dotnet=args.dotnet, potential=args.potential)
 
     opt = torch.optim.Adam(main.parameters(), lr=args.lr)
@@ -365,7 +370,12 @@ def main():
                     help="model scale: small (173k), medium (532k), large (1.2M), xl (1.7M), "
                          "100x (17.6M). small is the recommended default — see README "
                          "'Model scale: bigger is not better here'")
-    ap.add_argument("--fixed-deck", action="store_true")
+    ap.add_argument("--fixed-deck", action="store_true", help="shorthand for --deck fixed")
+    ap.add_argument("--deck", type=str, default=None, choices=DECK_MODES,
+                    help="fixed (Mage mirror) | variedmirror (random deck, same both seats) | random")
+    ap.add_argument("--card-text", type=str, default=None,
+                    help="path to a card_text.py .npz; uses frozen card-text embeddings "
+                         "instead of the learned id embedding")
     ap.add_argument("--eval-only", type=str, default=None,
                     help="evaluate a checkpoint and exit (no training)")
     ap.add_argument("--eval-every", type=int, default=10)

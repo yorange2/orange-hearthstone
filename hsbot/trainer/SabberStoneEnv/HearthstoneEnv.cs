@@ -30,10 +30,27 @@ public sealed class HearthstoneEnv
     };
 
     private readonly Random _rnd;
-    private readonly bool _fixedDeck;
+    private readonly DeckMode _deckMode;
     private const int MaxDecisions = 800; // safety cap; HS games terminate via fatigue anyway
     private const double PotentialScale = 200.0;
     private const double BoardPotentialScale = 60.0;
+
+    /// <summary>How each game's decks are chosen.</summary>
+    public enum DeckMode
+    {
+        /// <summary>Mage mirror with a deterministic 30-card fill; only draw order varies. Lowest
+        /// variance, and the setting every number in the README so far was measured on. Also the
+        /// setting in which card identity is worth least: both players draw from the same 30
+        /// cards, so there is nothing unseen to generalise to.</summary>
+        Fixed,
+        /// <summary>Random class, random legal 30-card deck, **identical for both players**. The
+        /// card pool varies game to game (so card semantics matter) while the matchup stays fair
+        /// (so win rate still measures policy, not who drew the better pile).</summary>
+        VariedMirror,
+        /// <summary>Random classes and an independent random fill per player — maximum variety,
+        /// but deck-quality asymmetry lands directly in the win rate as noise.</summary>
+        Random,
+    }
 
     /// <summary>Which board-state function to use as the shaping potential Φ.</summary>
     public enum PotentialMode
@@ -59,10 +76,10 @@ public sealed class HearthstoneEnv
     private List<SabberStoneCore.Tasks.PlayerTasks.PlayerTask> _legal = new();
     private int _decisions;
 
-    public HearthstoneEnv(int seed, bool fixedDeck = false, PotentialMode potential = PotentialMode.MidRange)
+    public HearthstoneEnv(int seed, DeckMode deck = DeckMode.Random, PotentialMode potential = PotentialMode.MidRange)
     {
         _rnd = new Random(seed);
-        _fixedDeck = fixedDeck;
+        _deckMode = deck;
         _potentialMode = potential;
     }
 
@@ -95,10 +112,27 @@ public sealed class HearthstoneEnv
 
     public void Reset()
     {
-        // Fixed-deck mode: a Mage mirror with a deterministic 30-card fill (only draw order
-        // varies) — big variance reduction vs random classes + random fill.
-        CardClass p1 = _fixedDeck ? CardClass.MAGE : Classes[_rnd.Next(Classes.Length)];
-        CardClass p2 = _fixedDeck ? CardClass.MAGE : Classes[_rnd.Next(Classes.Length)];
+        CardClass p1, p2;
+        List<Card>? deck1 = null, deck2 = null;
+
+        if (_deckMode == DeckMode.VariedMirror)
+        {
+            (CardClass cls, List<Card> deck) = DeckBuilder.Mirror(Classes, _rnd);
+            p1 = p2 = cls;
+            // Two copies of the same list: the decks are identical in content, but SabberStone
+            // owns each player's list once the game starts, so sharing one instance across both
+            // seats would couple them.
+            deck1 = new List<Card>(deck);
+            deck2 = new List<Card>(deck);
+        }
+        else
+        {
+            // Fixed: a Mage mirror with a deterministic 30-card fill (only draw order varies) —
+            // big variance reduction vs random classes + random fill.
+            p1 = _deckMode == DeckMode.Fixed ? CardClass.MAGE : Classes[_rnd.Next(Classes.Length)];
+            p2 = _deckMode == DeckMode.Fixed ? CardClass.MAGE : Classes[_rnd.Next(Classes.Length)];
+        }
+
         _game = new Game(new GameConfig
         {
             // Derive the game's own RNG from the env seed. Without this, GameConfig.RandomSeed is
@@ -109,8 +143,12 @@ public sealed class HearthstoneEnv
             StartPlayer = _rnd.Next(1, 3),
             Player1HeroClass = p1,
             Player2HeroClass = p2,
-            FillDecks = true,
-            FillDecksPredictably = _fixedDeck,
+            Player1Deck = deck1,
+            Player2Deck = deck2,
+            // VariedMirror supplies a complete 30-card list, so fill has nothing left to add;
+            // leaving it on would top up from a different pool and break the mirror.
+            FillDecks = _deckMode != DeckMode.VariedMirror,
+            FillDecksPredictably = _deckMode == DeckMode.Fixed,
             Shuffle = true,
             SkipMulligan = true,
             Logging = false,

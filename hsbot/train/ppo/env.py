@@ -39,12 +39,33 @@ _DEFAULT_DLL = (
 )
 
 
+DECK_MODES = ("fixed", "variedmirror", "random")
+
+
+def deck_mode(args) -> str:
+    """Resolve the deck mode from parsed CLI args: explicit `--deck` wins, `--fixed-deck` is the
+    legacy shorthand kept because every recipe in the README passes it."""
+    if getattr(args, "deck", None):
+        return args.deck
+    return "fixed" if getattr(args, "fixed_deck", False) else "random"
+
+
+def _deck_arg(deck: str | bool) -> str:
+    """Normalize a deck mode for the C# argv. `True`/`False` are still accepted because
+    `--fixed-deck` is a bool flag on both entry points and every recipe in the README passes it."""
+    if isinstance(deck, bool):
+        return "fixed" if deck else "random"
+    if deck not in DECK_MODES:
+        raise ValueError(f"unknown deck mode {deck!r}; expected one of {DECK_MODES}")
+    return deck
+
+
 class SabberEnv:
-    def __init__(self, seed: int = 1, fixed_deck: bool = False, dll: str | None = None,
+    def __init__(self, seed: int = 1, deck: str | bool = "random", dll: str | None = None,
                  dotnet: str = "dotnet", potential: str = "midrange"):
         dll_path = str(dll or _DEFAULT_DLL)
         self.proc = subprocess.Popen(
-            [dotnet, dll_path, str(seed), "1" if fixed_deck else "0", potential],
+            [dotnet, dll_path, str(seed), _deck_arg(deck), potential],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1,
         )
 
@@ -87,6 +108,16 @@ class SabberEnv:
 
     def card_vocab(self) -> int:
         return int(self.meta()["cardVocab"])
+
+    def card_ids_hash(self) -> str:
+        """Fingerprint of this env's card-id list, for validating a card-text matrix against it."""
+        return str(self.meta().get("cardIdsHash", ""))
+
+    def cards(self) -> list[dict]:
+        """Id / name / rules text for every vocabulary row, in index order (row 0 is the reserved
+        blank). Used to build the card-text embedding matrix — sourced from the env so the rows
+        line up with the indices the env emits rather than by re-deriving the ordering."""
+        return self._rpc("cards")["cards"]
 
     def reset(self) -> "Obs":
         return self._obs(self._rpc("reset"))
@@ -134,10 +165,10 @@ class VecEnv:
     then reads their replies — the throughput multiplier. Inference is batched by the caller.
     """
 
-    def __init__(self, n: int, seed0: int = 1, fixed_deck: bool = False,
+    def __init__(self, n: int, seed0: int = 1, deck: str | bool = "random",
                  dll: str | None = None, dotnet: str = "dotnet", potential: str = "midrange"):
         self.n = n
-        self.envs = [SabberEnv(seed0 + i, fixed_deck, dll, dotnet, potential) for i in range(n)]
+        self.envs = [SabberEnv(seed0 + i, deck, dll, dotnet, potential) for i in range(n)]
 
     def card_vocab(self) -> int:
         return self.envs[0].card_vocab()

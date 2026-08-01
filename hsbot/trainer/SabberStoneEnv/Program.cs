@@ -9,12 +9,21 @@ using SabberStoneEnv;
 // `priv` is the current mover's opponent-hidden info (critic-only). Swap stdio for gRPC to scale.
 
 int seed = args.Length > 0 ? int.Parse(args[0]) : 1;
-bool fixedDeck = args.Length > 1 && args[1] == "1";
+// args[1]: deck mode. Accepts the historical "1"/"0" (fixed / random) so existing callers keep
+// working, plus the named modes ("fixed" | "variedmirror" | "random") — see DeckMode.
+var deck = args.Length > 1
+    ? args[1] switch
+    {
+        "1" => HearthstoneEnv.DeckMode.Fixed,
+        "0" => HearthstoneEnv.DeckMode.Random,
+        var s => System.Enum.Parse<HearthstoneEnv.DeckMode>(s, ignoreCase: true),
+    }
+    : HearthstoneEnv.DeckMode.Random;
 // args[2]: shaping-potential mode ("midrange" default | "board" | "none") — see PotentialMode.
 var potential = args.Length > 2
     ? System.Enum.Parse<HearthstoneEnv.PotentialMode>(args[2], ignoreCase: true)
     : HearthstoneEnv.PotentialMode.MidRange;
-var env = new HearthstoneEnv(seed, fixedDeck, potential);
+var env = new HearthstoneEnv(seed, deck, potential);
 var jsonOpts = new JsonSerializerOptions
 {
     PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
@@ -58,7 +67,19 @@ while ((line = Console.In.ReadLine()) != null)
     {
         // Static env facts the Python side needs before building the model — currently the
         // card-embedding vocabulary size. Queried once at startup, so it must not touch game state.
-        stdout.WriteLine(JsonSerializer.Serialize(new Meta { CardVocab = CardVocab.Count }, jsonOpts));
+        stdout.WriteLine(JsonSerializer.Serialize(new Meta { CardVocab = CardVocab.Count, CardIdsHash = CardVocab.IdsHash() }, jsonOpts));
+        stdout.Flush();
+    }
+    else if (line == "cards")
+    {
+        // Id / name / rules text for every vocabulary row, in index order, so the Python side can
+        // build a card-text embedding matrix that is aligned with these indices by construction
+        // rather than by a re-derivation that can drift. Static; does not touch game state.
+        var rows = CardVocab.Rows();
+        var cards = new CardRow[rows.Length];
+        for (int i = 0; i < rows.Length; i++)
+            cards[i] = new CardRow { Id = rows[i].Id, Name = rows[i].Name, Text = rows[i].Text };
+        stdout.WriteLine(JsonSerializer.Serialize(new CardsResponse { Cards = cards }, jsonOpts));
         stdout.Flush();
     }
     else if (line == "close")
@@ -97,6 +118,19 @@ sealed class Response
 sealed class Meta
 {
     public int CardVocab { get; set; }
+    public string CardIdsHash { get; set; } = "";
+}
+
+sealed class CardRow
+{
+    public string Id { get; set; } = "";
+    public string Name { get; set; } = "";
+    public string Text { get; set; } = "";
+}
+
+sealed class CardsResponse
+{
+    public CardRow[] Cards { get; set; } = System.Array.Empty<CardRow>();
 }
 
 sealed class SimResponse

@@ -15,7 +15,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from env import SabberEnv, TOKEN_DIM, ACT_DIM, PRIV_DIM
+import card_text as card_text_mod
+from env import SabberEnv, DECK_MODES, deck_mode, TOKEN_DIM, ACT_DIM, PRIV_DIM
 from ppo import ActorCritic, pad, pad_ids
 
 
@@ -120,7 +121,13 @@ def main():
     ap.add_argument("--no-card-emb", action="store_true",
                     help="ablation: disable the card embedding (card-blind observation)")
     ap.add_argument("--out", type=str, default="pretrained.pt")
-    ap.add_argument("--fixed-deck", action="store_true")
+    ap.add_argument("--fixed-deck", action="store_true",
+                    help="shorthand for --deck fixed")
+    ap.add_argument("--deck", type=str, default=None, choices=DECK_MODES,
+                    help="fixed (Mage mirror) | variedmirror (random deck, same both seats) | random")
+    ap.add_argument("--card-text", type=str, default=None,
+                    help="path to a card_text.py .npz; uses frozen card-text embeddings "
+                         "instead of the learned id embedding")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--dll", type=str, default=None)
     ap.add_argument("--dotnet", type=str, default="dotnet")
@@ -133,8 +140,9 @@ def main():
     # Phase 1: generate data
     print(f"Phase 1: generating data ({args.games} greedy-vs-greedy games)...", flush=True)
     t0 = time.time()
-    env = SabberEnv(seed=args.seed, fixed_deck=args.fixed_deck, dll=args.dll, dotnet=args.dotnet)
+    env = SabberEnv(seed=args.seed, deck=deck_mode(args), dll=args.dll, dotnet=args.dotnet)
     env_vocab = env.card_vocab()
+    env_ids_hash = env.card_ids_hash()
     data = generate_data(env, args.games)
     env.close()
     dt = time.time() - t0
@@ -142,10 +150,13 @@ def main():
 
     # Phase 2: pre-train
     print(f"\nPhase 2: behavioral cloning ({args.epochs} epochs, device={device})...", flush=True)
-    card_vocab = 0 if args.no_card_emb else env_vocab
-    policy = ActorCritic(size=args.size, card_vocab=card_vocab, card_dim=args.card_dim).to(device)
+    card_vocab, card_text = card_text_mod.resolve(args.card_text, env_vocab, args.no_card_emb, env_ids_hash)
+    policy = ActorCritic(size=args.size, card_vocab=card_vocab, card_dim=args.card_dim,
+                         card_text=card_text).to(device)
     params = sum(p.numel() for p in policy.parameters())
-    print(f"Model: {args.size} ({params:,} params, card_vocab={card_vocab})", flush=True)
+    trainable = sum(p.numel() for p in policy.parameters() if p.requires_grad)
+    print(f"Model: {args.size} ({params:,} params, {trainable:,} trainable)", flush=True)
+    print(card_text_mod.describe(card_vocab, card_text, args.card_dim), flush=True)
     pretrain(policy, data, args.epochs, args.batch_size, args.lr, device=device)
 
     # Phase 3: save
