@@ -16,7 +16,7 @@ import torch
 import torch.nn as nn
 
 from env import SabberEnv, TOKEN_DIM, ACT_DIM, PRIV_DIM
-from ppo import ActorCritic, pad
+from ppo import ActorCritic, pad, pad_ids
 
 
 def generate_data(env, num_games: int) -> list[dict]:
@@ -30,11 +30,12 @@ def generate_data(env, num_games: int) -> list[dict]:
         while True:
             # Record the current state
             cur_tokens = obs.tokens.copy()
+            cur_card_ids = obs.card_ids.copy()
             cur_actions = obs.actions.copy()
             # Play greedy from this state
             obs, done, _winner = env.step_greedy()
             # obs.greedy_action is the action greedy chose for (cur_tokens, cur_actions)
-            data.append(dict(tokens=cur_tokens, actions=cur_actions,
+            data.append(dict(tokens=cur_tokens, card_ids=cur_card_ids, actions=cur_actions,
                              idx=obs.greedy_action))
             if done:
                 break
@@ -56,18 +57,19 @@ def pretrain(policy, data, epochs, batch_size, lr, device):
         for mb in perm.split(batch_size):
             batch = [data[i] for i in mb.tolist()]
             tok, tmask = pad([b["tokens"] for b in batch], TOKEN_DIM)
+            cid = pad_ids([b["card_ids"] for b in batch], tok.shape[1])
             act, amask = pad([b["actions"] for b in batch], ACT_DIM)
             target = torch.tensor([b["idx"] for b in batch])
             priv = torch.zeros(len(batch), PRIV_DIM, dtype=torch.float32)  # dummy priv (policy logits ignore it)
             hist, mask = policy.initial_state(len(batch))  # BC treats each decision independently: empty history
 
-            tok, tmask = tok.to(device), tmask.to(device)
+            tok, tmask, cid = tok.to(device), tmask.to(device), cid.to(device)
             act, amask = act.to(device), amask.to(device)
             target = target.to(device)
             priv = priv.to(device)
             hist, mask = hist.to(device), mask.to(device)
 
-            logits, _, _, _ = policy(tok, tmask, hist, mask, priv, act, amask)
+            logits, _, _, _ = policy(tok, tmask, hist, mask, priv, act, amask, cid)
             loss = nn.CrossEntropyLoss()(logits, target)
             opt.zero_grad()
             loss.backward()
@@ -90,12 +92,13 @@ def evaluate_imitation(policy, data, device="cpu"):
     for i in range(0, len(data), 64):
         batch = data[i:i + 64]
         tok, tmask = pad([b["tokens"] for b in batch], TOKEN_DIM)
+        cid = pad_ids([b["card_ids"] for b in batch], tok.shape[1]).to(device)
         act, amask = pad([b["actions"] for b in batch], ACT_DIM)
         target = np.array([b["idx"] for b in batch])
         priv = torch.zeros(len(batch), PRIV_DIM, device=device)
         hist, mask = (t.to(device) for t in policy.initial_state(len(batch)))
         logits, _, _, _ = policy(tok.to(device), tmask.to(device), hist, mask,
-                                  priv, act.to(device), amask.to(device))
+                                  priv, act.to(device), amask.to(device), cid)
         pred = logits.argmax(dim=1).cpu().numpy()
         correct += (pred == target).sum()
     policy.train()
@@ -112,6 +115,10 @@ def main():
                     choices=["small", "medium", "large", "xl", "100x"])
     ap.add_argument("--device", type=str, default="auto", choices=DEVICE_CHOICES,
                     help="compute device (auto = cuda > mps > cpu)")
+    ap.add_argument("--card-dim", type=int, default=16,
+                    help="card-identity embedding width (Phase 1)")
+    ap.add_argument("--no-card-emb", action="store_true",
+                    help="ablation: disable the card embedding (card-blind observation)")
     ap.add_argument("--out", type=str, default="pretrained.pt")
     ap.add_argument("--fixed-deck", action="store_true")
     ap.add_argument("--seed", type=int, default=42)
@@ -127,6 +134,7 @@ def main():
     print(f"Phase 1: generating data ({args.games} greedy-vs-greedy games)...", flush=True)
     t0 = time.time()
     env = SabberEnv(seed=args.seed, fixed_deck=args.fixed_deck, dll=args.dll, dotnet=args.dotnet)
+    env_vocab = env.card_vocab()
     data = generate_data(env, args.games)
     env.close()
     dt = time.time() - t0
@@ -134,9 +142,10 @@ def main():
 
     # Phase 2: pre-train
     print(f"\nPhase 2: behavioral cloning ({args.epochs} epochs, device={device})...", flush=True)
-    policy = ActorCritic(size=args.size).to(device)
+    card_vocab = 0 if args.no_card_emb else env_vocab
+    policy = ActorCritic(size=args.size, card_vocab=card_vocab, card_dim=args.card_dim).to(device)
     params = sum(p.numel() for p in policy.parameters())
-    print(f"Model: {args.size} ({params:,} params)", flush=True)
+    print(f"Model: {args.size} ({params:,} params, card_vocab={card_vocab})", flush=True)
     pretrain(policy, data, args.epochs, args.batch_size, args.lr, device=device)
 
     # Phase 3: save

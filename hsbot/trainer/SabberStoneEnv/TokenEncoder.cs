@@ -31,22 +31,41 @@ public static class TokenEncoder
     private const int MyHero = 0, OppHero = 1, MyMinion = 2, OppMinion = 3,
                       MyHand = 4, MyWeapon = 5, OppWeapon = 6, MyPower = 7;
 
-    public static float[][] Encode(Game game)
+    /// <summary>
+    /// Tokens plus a parallel array of <see cref="CardVocab"/> indices — one per token, same
+    /// order. The identity is kept out of the float vector on purpose: it is a categorical
+    /// lookup for an embedding, not a magnitude, and stuffing a large integer into a normalized
+    /// float feature would be both lossy and meaningless to a linear layer.
+    /// </summary>
+    public static (float[][] Tokens, int[] CardIds) Encode(Game game) => Encode(game, game.CurrentPlayer);
+
+    /// <summary>
+    /// Encode from an explicit perspective. Needed for one-ply lookahead: after processing a
+    /// candidate action the turn may flip, and a state must still be valued from the *acting*
+    /// player's point of view or the sign of the critic's output is inverted.
+    /// </summary>
+    public static (float[][] Tokens, int[] CardIds) Encode(Game game, Controller me)
     {
-        Controller me = game.CurrentPlayer;
-        Controller opp = game.CurrentOpponent;
+        Controller opp = me.Opponent;
         var toks = new List<float[]>();
+        var ids = new List<int>();
 
-        toks.Add(HeroTok(MyHero, true, me.Hero));
-        toks.Add(HeroTok(OppHero, false, opp.Hero));
-        foreach (Minion m in me.BoardZone) toks.Add(MinionTok(MyMinion, true, m));
-        foreach (Minion m in opp.BoardZone) toks.Add(MinionTok(OppMinion, false, m));
-        foreach (IPlayable p in me.HandZone) toks.Add(HandTok(MyHand, true, p));
-        if (me.Hero.Weapon != null) toks.Add(WeaponTok(MyWeapon, true, me.Hero.Weapon));
-        if (opp.Hero.Weapon != null) toks.Add(WeaponTok(OppWeapon, false, opp.Hero.Weapon));
-        if (me.Hero.HeroPower != null) toks.Add(PowerTok(MyPower, true, me.Hero.HeroPower));
+        void Add(float[] tok, Card? card)
+        {
+            toks.Add(tok);
+            ids.Add(CardVocab.IndexOf(card));
+        }
 
-        return toks.ToArray();
+        Add(HeroTok(MyHero, true, me.Hero), me.Hero.Card);
+        Add(HeroTok(OppHero, false, opp.Hero), opp.Hero.Card);
+        foreach (Minion m in me.BoardZone) Add(MinionTok(MyMinion, true, m), m.Card);
+        foreach (Minion m in opp.BoardZone) Add(MinionTok(OppMinion, false, m), m.Card);
+        foreach (IPlayable p in me.HandZone) Add(HandTok(MyHand, true, p), p.Card);
+        if (me.Hero.Weapon != null) Add(WeaponTok(MyWeapon, true, me.Hero.Weapon), me.Hero.Weapon.Card);
+        if (opp.Hero.Weapon != null) Add(WeaponTok(OppWeapon, false, opp.Hero.Weapon), opp.Hero.Weapon.Card);
+        if (me.Hero.HeroPower != null) Add(PowerTok(MyPower, true, me.Hero.HeroPower), me.Hero.HeroPower.Card);
+
+        return (toks.ToArray(), ids.ToArray());
     }
 
     private static float[] New(int type, bool mine)

@@ -18,15 +18,26 @@ class EntityEncoder(nn.Module):
     """Transformer over the entity-token set -> a single state embedding (masked mean-pool).
     No positional encoding: entities are a set, so the encoder is permutation-invariant."""
 
-    def __init__(self, token_dim=TOKEN_DIM, d=64, nhead=4, layers=2, ff=128):
+    def __init__(self, token_dim=TOKEN_DIM, d=64, nhead=4, layers=2, ff=128,
+                 card_vocab=0, card_dim=16):
         super().__init__()
-        self.embed = nn.Linear(token_dim, d)
+        # Card identity is categorical, so it enters as an embedding rather than a float feature.
+        # Without it the 18-float token carries no card semantics at all: two different 4-cost
+        # spells are byte-identical inputs, which caps achievable play below the greedy heuristic
+        # (greedy scores through the real simulator and implicitly knows every card's effect).
+        self.card_emb = nn.Embedding(card_vocab, card_dim, padding_idx=0) if card_vocab else None
+        in_dim = token_dim + (card_dim if self.card_emb is not None else 0)
+        self.embed = nn.Linear(in_dim, d)
         layer = nn.TransformerEncoderLayer(d, nhead, dim_feedforward=ff, batch_first=True)
         self.tr = nn.TransformerEncoder(layer, num_layers=layers)
         self.out_dim = d
 
-    def forward(self, tokens, tmask):
-        """tokens [B,T,token_dim]; tmask [B,T] bool (True = real). -> [B,d]."""
+    def forward(self, tokens, tmask, card_ids=None):
+        """tokens [B,T,token_dim]; tmask [B,T] bool (True = real); card_ids [B,T] int64. -> [B,d]."""
+        if self.card_emb is not None:
+            if card_ids is None:
+                card_ids = torch.zeros(tokens.shape[:2], dtype=torch.long, device=tokens.device)
+            tokens = torch.cat([tokens, self.card_emb(card_ids)], dim=-1)
         x = self.embed(tokens)
         x = self.tr(x, src_key_padding_mask=~tmask)          # ignore padded tokens
         m = tmask.float().unsqueeze(-1)                       # [B,T,1]
@@ -75,7 +86,8 @@ class ActorCritic(nn.Module):
     unbounded-but-lossy state; recent board history dominates the belief in practice.
     """
 
-    def __init__(self, act_dim=ACT_DIM, priv_dim=PRIV_DIM, hid=128, mem=MEM, size="small"):
+    def __init__(self, act_dim=ACT_DIM, priv_dim=PRIV_DIM, hid=128, mem=MEM, size="small",
+                 card_vocab=0, card_dim=16):
         super().__init__()
         # Presets scale entity-encoder + temporal-encoder dimensions together.
         # small  (173k) — original, for quick iteration
@@ -95,7 +107,8 @@ class ActorCritic(nn.Module):
         self.mem = mem
         self.d = d
 
-        self.enc = EntityEncoder(d=d, nhead=nhead, layers=layers, ff=ff)
+        self.enc = EntityEncoder(d=d, nhead=nhead, layers=layers, ff=ff,
+                                 card_vocab=card_vocab, card_dim=card_dim)
         self.temporal = TemporalEncoder(d=d, mem=mem, nhead=nhead, layers=layers, ff=ff)
         self.scorer = nn.Sequential(nn.Linear(d + act_dim, hid), nn.ReLU(), nn.Linear(hid, 1))
         self.value_enc = nn.Sequential(nn.Linear(d + priv_dim, hid), nn.ReLU(),
@@ -108,8 +121,8 @@ class ActorCritic(nn.Module):
         mask = torch.zeros(batch, self.mem, dtype=torch.bool)
         return hist, mask
 
-    def forward(self, tokens, tmask, hist_in, mask_in, priv, actions, amask):
-        e = self.enc(tokens, tmask)                          # [B,d] current per-state embedding
+    def forward(self, tokens, tmask, hist_in, mask_in, priv, actions, amask, card_ids=None):
+        e = self.enc(tokens, tmask, card_ids)                # [B,d] current per-state embedding
         # shift the window left (drop oldest) and append the current embedding at slot -1
         hist = torch.cat([hist_in[:, 1:, :], e.unsqueeze(1)], dim=1)          # [B,MEM,d]
         ones = torch.ones(e.shape[0], 1, dtype=torch.bool, device=e.device)
@@ -134,10 +147,11 @@ def act(policy, obs, hist_in, mask_in, argmax=False):
     dev = next(policy.parameters()).device
     tk = torch.from_numpy(obs.tokens).unsqueeze(0).to(dev)
     tm = torch.ones(1, obs.tokens.shape[0], dtype=torch.bool, device=dev)
+    ci = torch.from_numpy(obs.card_ids).unsqueeze(0).to(dev)
     p = torch.from_numpy(obs.priv).unsqueeze(0).to(dev)
     a = torch.from_numpy(obs.actions).unsqueeze(0).to(dev)
     am = torch.ones(1, obs.actions.shape[0], dtype=torch.bool, device=dev)
-    logits, v, hist, mask = policy(tk, tm, hist_in.to(dev), mask_in.to(dev), p, a, am)
+    logits, v, hist, mask = policy(tk, tm, hist_in.to(dev), mask_in.to(dev), p, a, am, ci)
     dist = torch.distributions.Categorical(logits=logits[0])
     idx = logits[0].argmax() if argmax else dist.sample()
     return int(idx), float(dist.log_prob(idx)), float(v[0]), hist.cpu(), mask.cpu()
@@ -168,6 +182,21 @@ def pad(seqs, dim):
     return torch.from_numpy(out), torch.from_numpy(mask)
 
 
+def pad_ids(seqs, maxn=None):
+    """Ragged list of [n_i] card-id arrays -> padded [B, maxN] int64. Pad value 0 is the
+    CardVocab "none/unknown" row, which is also the embedding's padding_idx, so padded slots
+    contribute a fixed zero vector and are masked out of attention regardless.
+
+    `maxn` must match the width `pad()` produced for the same batch, otherwise tokens and ids
+    would be misaligned."""
+    b = len(seqs)
+    maxn = maxn if maxn is not None else max(s.shape[0] for s in seqs)
+    out = np.zeros((b, maxn), np.int64)
+    for i, s in enumerate(seqs):
+        out[i, : s.shape[0]] = s
+    return torch.from_numpy(out)
+
+
 OPPONENT_STRATEGIES = ["midrange", "aggro", "control", "fatigue", "ramp"]
 
 
@@ -187,7 +216,7 @@ def wilson_ci(wins, n, z=1.96):
 
 
 @torch.no_grad()
-def evaluate(env, main, episodes, opponent="random", rng=None, argmax=True):
+def evaluate(env, main, episodes, opponent="random", rng=None, argmax=True, lookahead=False):
     """Benchmark the recurrent main policy vs a fixed opponent. Returns (wins, episodes) so the
     caller can attach a confidence interval — a bare rate invites reading noise as signal.
     opponent: "random", "greedy"/"midrange", or any of "aggro","control","fatigue","ramp".
@@ -207,7 +236,10 @@ def evaluate(env, main, episodes, opponent="random", rng=None, argmax=True):
         hist, mask = main.initial_state()
         while True:
             if obs.player == seat:
-                i, _, _, hist, mask = act(main, obs, hist, mask, argmax=argmax)
+                if lookahead:
+                    i, hist, mask = act_lookahead(main, env, obs, hist, mask)
+                else:
+                    i, _, _, hist, mask = act(main, obs, hist, mask, argmax=argmax)
                 obs, done, winner = env.step(i)
             elif opponent == "random":
                 obs, done, winner = env.step(rng.randrange(obs.actions.shape[0]))
@@ -219,3 +251,60 @@ def evaluate(env, main, episodes, opponent="random", rng=None, argmax=True):
                 wins += int(winner == seat)
                 break
     return wins, episodes
+
+
+@torch.no_grad()
+def act_lookahead(policy, env, obs, hist_in, mask_in):
+    """Phase 3: one-ply lookahead scored by the learned critic.
+
+    Greedy searches one ply with a handcrafted board score; the plain policy searches zero plies
+    with a learned score. This closes that gap: clone-and-apply every legal action in the engine,
+    then value each resulting state with the critic and take the best. Terminal results use their
+    true ±1 outcome rather than a value estimate.
+
+    Returns (idx, hist_out, mask_out). The carried belief window is advanced with the *actual*
+    current state, exactly as `act` does — lookahead picks the move, it does not rewrite history.
+    """
+    dev = next(policy.parameters()).device
+    sims = env.simulate()
+    n = len(sims)
+    if n == 0:
+        return 0, hist_in, mask_in
+
+    scores = [None] * n
+    live = [i for i, s in enumerate(sims) if not s["terminal"] and s["tokens"].shape[0] > 0]
+    for i, s in enumerate(sims):
+        if s["terminal"]:
+            scores[i] = float(s["outcome"])
+        elif i not in live:
+            scores[i] = -1e9  # malformed/illegal — never choose
+
+    if live:
+        toks = [sims[i]["tokens"] for i in live]
+        tk, tm = pad(toks, TOKEN_DIM)
+        ci = pad_ids([sims[i]["card_ids"] for i in live], tk.shape[1])
+        pr = torch.from_numpy(np.asarray([sims[i]["priv"] for i in live], np.float32))
+        # Value each candidate from the same belief window: encode the hypothetical state, push it
+        # into a copy of the window, and read the critic. No action set is needed — only the value.
+        e = policy.enc(tk.to(dev), tm.to(dev), ci.to(dev))
+        h_in = hist_in.to(dev).expand(len(live), -1, -1)
+        m_in = mask_in.to(dev).expand(len(live), -1)
+        hist = torch.cat([h_in[:, 1:, :], e.unsqueeze(1)], dim=1)
+        ones = torch.ones(len(live), 1, dtype=torch.bool, device=dev)
+        mask = torch.cat([m_in[:, 1:], ones], dim=1)
+        h = policy.temporal(hist, mask)
+        v = policy.value(policy.value_enc(torch.cat([h, pr.to(dev)], dim=-1))).squeeze(-1)
+        for k, i in enumerate(live):
+            # Negamax: when the turn flipped, v is the opponent's value for that state.
+            scores[i] = float(v[k]) if sims[i]["mine"] else -float(v[k])
+
+    best = int(max(range(n), key=lambda i: scores[i]))
+    # Advance the belief window with the real current state (not the hypothetical one).
+    tk = torch.from_numpy(obs.tokens).unsqueeze(0).to(dev)
+    tm = torch.ones(1, obs.tokens.shape[0], dtype=torch.bool, device=dev)
+    ci = torch.from_numpy(obs.card_ids).unsqueeze(0).to(dev)
+    e = policy.enc(tk, tm, ci)
+    hist = torch.cat([hist_in.to(dev)[:, 1:, :], e.unsqueeze(1)], dim=1)
+    ones = torch.ones(1, 1, dtype=torch.bool, device=dev)
+    mask = torch.cat([mask_in.to(dev)[:, 1:], ones], dim=1)
+    return best, hist.cpu(), mask.cpu()

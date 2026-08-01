@@ -276,7 +276,7 @@ Note that fixing determinism **changes the numbers**: every win rate recorded be
 was measured under a nondeterministic env with a sampling policy, so the scaling table above is
 not directly comparable to anything measured after. Re-baseline before comparing.
 
-### Phase 1 — Put card identity in the observation *(highest expected gain)*
+### Phase 1 — Put card identity in the observation ✅ *(implemented)*
 
 The hard information ceiling. A token is 18 floats with **no card ID and no card text**, so two
 different 4-cost spells are identical inputs and the policy cannot represent "Polymorph the 7/7"
@@ -290,13 +290,27 @@ and implicitly knows what every card does.
   collectibles or hash into a fixed vocab. Under `--fixed-deck` it is ~30 unique cards — start
   there, widen later.
 
-Changes `TOKEN_DIM`, so it invalidates existing checkpoints. RL-only: the flat `FeatureExtractor`
+**As built.** `CardVocab` assigns dense indices by sorting card `Id` strings ordinally — every
+env process must agree on the mapping or tokens from different envs mean different things, and
+`Cards.All` is a `Dictionary.Values` with no ordering guarantee. Index 0 is a reserved
+none/unknown row and doubles as the embedding `padding_idx`. The env reports the vocabulary over
+a new `meta` command so the model is sized from the env rather than a hard-coded constant. Card
+identity is emitted as a **parallel `cardIds` array**, not squeezed into the float token: it is a
+categorical lookup, not a magnitude.
+
+Vocabulary is **8303**, so `--card-dim 16` adds ~134k nominal params to a 173k model. That looks
+like a serious confound with the capacity question — but only **471** distinct cards actually
+appear in fixed-deck play, so roughly **7.5k** embedding params ever receive a gradient. Report
+both numbers; the nominal figure overstates the added capacity by ~18×.
+
+Existing checkpoints do not load into a card-embedding model (`--no-card-emb` restores the old
+card-blind architecture, and is the ablation control). RL-only: the flat `FeatureExtractor`
 feeding the ONNX value net is a separate contract and is untouched.
 
 **Gate:** BC top-1 must clear the current 0.823 *before* spending anything on PPO. If it does
 not, the embedding is miswired — a cheap early signal.
 
-### Phase 2 — Decouple the reward from greedy *(cheap, high information)*
+### Phase 2 — Decouple the reward from greedy ✅ *(implemented)*
 
 Three anchors hold the policy at heuristic level, the strongest being that the shaping potential
 **is** greedy's own objective (`HearthstoneEnv.cs:147`).
@@ -309,29 +323,43 @@ Three anchors hold the policy at heuristic level, the strongest being that the s
 Genuinely uncertain: shaping is part of what makes the current run learn at all, so removing it
 may hurt before it helps. That is why it is an ablation, not a change.
 
-### Phase 3 — Give the agent the lookahead greedy already has
+### Phase 3 — Give the agent the lookahead greedy already has ✅ *(implemented; no gain yet)*
 
-Greedy is one-ply search + handcrafted score; the agent is **zero-ply** + learned score. Add a
-`simulate <idx>` endpoint to the C# env and score each legal action by the learned value of the
-resulting state. Largest structural gap after Phase 1, and it reuses the critic already being
-trained. Costs inference time (N simulations per decision), so measure it as an eval/deployment
-lever separately from training changes.
+Greedy is one-ply search + handcrafted score; the agent is **zero-ply** + learned score. A
+`simulate` command clones the game once per legal action and returns each resulting state;
+`act_lookahead` values them with the critic and takes the best (`--lookahead`).
 
-### Phase 4 — Optimization hygiene, then re-test scale
+**A perspective bug worth recording.** The first version encoded each resulting state from the
+*acting* player's view. But after an action the turn often flips, and the critic has only ever
+seen states from the **player to move** — so those inputs were out of distribution and the value
+estimates were garbage. Measured effect on one checkpoint: **0.667 → 0.067** vs greedy. Encoding
+from the player to move and negating when the turn flipped (standard negamax) restored it to
+0.567. Any value-based search over a two-player game needs this; getting the sign right is not
+optional bookkeeping.
+
+**It still does not beat plain argmax** (0.567 vs 0.667 at n=30 — intervals overlap heavily, so
+neither is resolved). A plausible reason: the **actor** head is explicitly trained to rank
+actions, while the **critic** is trained as a variance-reduction baseline. Substituting value
+ranking throws away the head that was trained for the job. Needs n≥400 to say anything real.
+
+### Phase 4 — Optimization hygiene, then re-test scale ✅ *(warmup implemented)*
 
 Only meaningful after Phases 0–1.
 
-- **LR warmup + lower LR for large models** — this is what broke `100x` above
+- **LR warmup + lower LR for large models** — this is what broke `100x` above. `--warmup-iters N`
+  gives a linear ramp before the cosine schedule; `0` (the default) reproduces the old schedule
+  exactly, so existing recipes are unchanged
 - Re-run the scale study with warmup, to answer the question the table above leaves open: does
   capacity help once optimization is not broken?
 - Raise the PPO sample budget (1.6M transitions at the full recipe)
 - Free speedup already measured: BC on `mps`, PPO on `cpu` ≈ 2× end-to-end
 
-### Phase 5 — Opponent diversity
+### Phase 5 — Opponent diversity ✅ *(implemented)*
 
-`--opponent-strategies` already supports all five heuristics but defaults to `midrange` alone.
-Training against the full set should reduce overfitting to one opponent. Cheap; note that eval is
-vs midrange, so this may not move the headline number even if the policy is genuinely better.
+`--opponent-strategies all` now expands to every heuristic (it already accepted a comma list but
+defaulted to `midrange` alone). Training against the full set should reduce overfitting to one
+opponent. Note that eval is vs midrange, so this may not move the headline number even if the
+policy is genuinely better.
 
 ### Not on the list
 
