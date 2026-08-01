@@ -666,12 +666,38 @@ and a richer observation buys agreement without buying strength. Future phases s
 it. (It also retires the earlier hope that Phase 1's flat BC gate was a fixed-deck artifact: on
 varied decks the gate moved and the win rate still did not.)
 
-**What this does not establish.** All six cells sit at ~0.49–0.50, below the **0.578** reference —
-including the `fixed`-deck evals. Two candidates, not separable from this data alone: varied-mirror
-is a harder task at equal budget, or this recipe is simply under-trained relative to whatever
-produced the reference `*best*` checkpoints. The missing control is a `blind` arm trained on
-`fixed` with *this exact recipe*; without it, "card identity does not help" is sound **at this
-budget** but "varied decks cost ~8 points" is not established.
+**Why all six cells sit below the 0.578 reference — the control.** Every arm lands at ~0.49–0.50,
+including on `fixed`, which raised two candidate explanations: varied-mirror is harder at equal
+budget, or this recipe is under-trained relative to whatever produced the reference `*best*`
+checkpoints. A `blind` arm trained on `fixed` with *this exact recipe* separates them (BC reused
+from the cancelled A/B, whose flags were identical apart from the deck mode):
+
+| arm | trained on | eval deck | pooled (n=1200) |
+| --- | --- | --- | --- |
+| control | `fixed` | `fixed` | **0.533** [0.505–0.561] |
+| experiment `blind` | `variedmirror` | `fixed` | 0.495 [0.467–0.523] |
+| experiment `blind` | `variedmirror` | `variedmirror` | 0.500 [0.472–0.528] |
+
+```
+train-on-fixed minus train-on-varied (both eval fixed):  +0.038  [-0.002, +0.078]
+control minus the 0.578 reference:                       -0.045  [-0.084, -0.005]
+```
+
+**Both effects are real, and they split the gap roughly in half.** The recipe is genuinely weaker
+than whatever produced the reference — −4.5 points, and that interval excludes zero, so some of
+the 0.578 headline rests on longer training and on `*best*` selection that this protocol
+deliberately refuses. Training on varied decks costs a further ~3.8 points, which at n=1200 falls
+*just* short of significance (the interval grazes zero at −0.002) and should be read as suggestive
+rather than established.
+
+The practically important line: **the control still beats greedy** (lower bound 0.505 > 0.5),
+while all three varied-trained arms sit at parity. So varied-mirror is a materially harder task,
+and the budget that suffices on `fixed` does not carry over.
+
+None of this rescues card identity. The control shares the `blind` arm's observation, so the gap
+it explains is a *budget and task-difficulty* gap, present identically in all three arms — it
+cannot mask a card-identity effect, which was measured within a single deck mode at fixed
+budget.
 
 ### Not on the list
 
