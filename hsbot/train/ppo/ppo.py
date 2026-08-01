@@ -74,14 +74,25 @@ class ActorCritic(nn.Module):
     unbounded-but-lossy state; recent board history dominates the belief in practice.
     """
 
-    def __init__(self, act_dim=ACT_DIM, priv_dim=PRIV_DIM, hid=128, mem=MEM):
+    def __init__(self, act_dim=ACT_DIM, priv_dim=PRIV_DIM, hid=128, mem=MEM, size="small"):
         super().__init__()
-        d = 64   # entity-encoder embedding / belief dimension
+        # Presets scale entity-encoder + temporal-encoder dimensions together.
+        # small  (173k) — original, for quick iteration
+        # medium (~500k) — 3× scale
+        # large  (~900k) — 5× scale
+        cfgs = {
+            "small":  dict(d=64,  nhead=4, layers=2, ff=128, hid=128),
+            "medium": dict(d=96,  nhead=4, layers=3, ff=192, hid=192),
+            "large":  dict(d=128, nhead=8, layers=4, ff=256, hid=256),
+            "xl":     dict(d=128, nhead=8, layers=5, ff=320, hid=320),
+        }
+        cfg = cfgs.get(size, cfgs["small"])
+        d = cfg["d"]; nhead = cfg["nhead"]; layers = cfg["layers"]; ff = cfg["ff"]; hid = cfg["hid"]
         self.mem = mem
         self.d = d
 
-        self.enc = EntityEncoder(d=d)
-        self.temporal = TemporalEncoder(d=d, mem=mem)
+        self.enc = EntityEncoder(d=d, nhead=nhead, layers=layers, ff=ff)
+        self.temporal = TemporalEncoder(d=d, mem=mem, nhead=nhead, layers=layers, ff=ff)
         self.scorer = nn.Sequential(nn.Linear(d + act_dim, hid), nn.ReLU(), nn.Linear(hid, 1))
         self.value_enc = nn.Sequential(nn.Linear(d + priv_dim, hid), nn.ReLU(),
                                         nn.Linear(hid, hid), nn.ReLU())
