@@ -45,6 +45,8 @@ cd ../hs-plugin && mvn test && mvn package
 
 Scaffold complete across all four stages; not yet run end-to-end (needs the toolchains + a Windows box for live play). See [`hsbot/README.md`](hsbot/README.md) for the checklist. CI (`.github/workflows/ci.yml`) runs the three parity suites + a training smoke test on push.
 
+The RL agent (`hsbot/train/ppo/`) currently plays at roughly parity with the one-ply greedy heuristic. The measured reasons why, and the prioritized plan to get past it, are in [`hsbot/train/ppo/README.md`](hsbot/train/ppo/README.md#plan-how-to-actually-get-past-50-vs-greedy).
+
 ## Caveats
 
 Automating the live client violates Blizzard's ToS and is bannable — use a throwaway account. Hearthstone-Script is GPL-3.0 with a non-commercial clause; keep this repo's use private. `vendor/` holds third-party code and is not tracked here.

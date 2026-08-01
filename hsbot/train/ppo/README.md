@@ -226,6 +226,89 @@ Highest-leverage fixes, in order: **add a card-identity embedding to the token**
 information ceiling), **decouple the shaping potential from `MidRangeScore`**, then raise the
 PPO sample budget. Model scale is the last lever, and only after LR warmup.
 
+## Plan: how to actually get past ~50% vs greedy
+
+Ordered by expected gain per unit of work, and derived from the measurements above rather than
+from generic RL advice. Each phase states the hypothesis it tests and the gate that decides
+whether to continue — several of these could fail, and the gates are there to find that out
+cheaply.
+
+### Phase 0 — Make the metric trustworthy *(blocking, ~1h)*
+
+Nothing downstream is measurable until this lands: a genuine 5-point gain is currently invisible
+inside the noise, and `*best*` selection inflates results by 8–18 points (see the note above).
+
+- Raise checkpoint-selection evals to ≥200 games, or stop selecting on them and evaluate the
+  final model instead
+- Standard eval: fixed **held-out** seed, **400 games**, report a Wilson 95% CI
+  (±0.049 at n=400, versus ±0.09 at the current n=30)
+- Add `--eval-seed` so eval seeds can never overlap training seeds
+- Re-measure `small` at full budget to establish one honest reference number
+
+**Gate:** a reference win rate with a confidence interval. Phases 1–4 are guesswork without it.
+
+### Phase 1 — Put card identity in the observation *(highest expected gain)*
+
+The hard information ceiling. A token is 18 floats with **no card ID and no card text**, so two
+different 4-cost spells are identical inputs and the policy cannot represent "Polymorph the 7/7"
+as distinct from "play a vanilla 4-drop". Greedy, by contrast, scores through the real simulator
+and implicitly knows what every card does.
+
+- `TokenEncoder.cs`: emit a card-ID index alongside the 18 floats
+- `env.py`: parse it into `Obs`
+- `ppo.py`: `nn.Embedding(vocab, 32)` concatenated into the token before `EntityEncoder`
+- Open question to settle first: SabberStone's card-ID space, and whether to embed all
+  collectibles or hash into a fixed vocab. Under `--fixed-deck` it is ~30 unique cards — start
+  there, widen later.
+
+Changes `TOKEN_DIM`, so it invalidates existing checkpoints. RL-only: the flat `FeatureExtractor`
+feeding the ONNX value net is a separate contract and is untouched.
+
+**Gate:** BC top-1 must clear the current 0.823 *before* spending anything on PPO. If it does
+not, the embedding is miswired — a cheap early signal.
+
+### Phase 2 — Decouple the reward from greedy *(cheap, high information)*
+
+Three anchors hold the policy at heuristic level, the strongest being that the shaping potential
+**is** greedy's own objective (`HearthstoneEnv.cs:147`).
+
+- Anneal `shaping_coef` → 0 over training so the final policy is not anchored
+- Ablate `--shaping-coef 0` vs `0.05` vs annealed at fixed budget
+- Consider a potential built from raw board state (health/tempo differential) instead of the
+  exact function greedy maximizes
+
+Genuinely uncertain: shaping is part of what makes the current run learn at all, so removing it
+may hurt before it helps. That is why it is an ablation, not a change.
+
+### Phase 3 — Give the agent the lookahead greedy already has
+
+Greedy is one-ply search + handcrafted score; the agent is **zero-ply** + learned score. Add a
+`simulate <idx>` endpoint to the C# env and score each legal action by the learned value of the
+resulting state. Largest structural gap after Phase 1, and it reuses the critic already being
+trained. Costs inference time (N simulations per decision), so measure it as an eval/deployment
+lever separately from training changes.
+
+### Phase 4 — Optimization hygiene, then re-test scale
+
+Only meaningful after Phases 0–1.
+
+- **LR warmup + lower LR for large models** — this is what broke `100x` above
+- Re-run the scale study with warmup, to answer the question the table above leaves open: does
+  capacity help once optimization is not broken?
+- Raise the PPO sample budget (1.6M transitions at the full recipe)
+- Free speedup already measured: BC on `mps`, PPO on `cpu` ≈ 2× end-to-end
+
+### Phase 5 — Opponent diversity
+
+`--opponent-strategies` already supports all five heuristics but defaults to `midrange` alone.
+Training against the full set should reduce overfitting to one opponent. Cheap; note that eval is
+vs midrange, so this may not move the headline number even if the policy is genuinely better.
+
+### Not on the list
+
+**Scaling the model further as a strength lever.** The evidence says capacity is not the binding
+constraint — information and signal are. Revisit only after Phase 1, and only with warmup.
+
 ## Upgrade paths
 
 - **Opponents**: self-play + greedy (done) → AlphaStar-style **main / exploiter /
