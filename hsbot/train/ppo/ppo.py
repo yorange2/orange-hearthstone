@@ -80,11 +80,14 @@ class ActorCritic(nn.Module):
         # small  (173k) — original, for quick iteration
         # medium (~500k) — 3× scale
         # large  (~900k) — 5× scale
+        # xl     (1.7M) — 10× scale
+        # 100x   (17.6M) — 100× the `small` baseline, for capacity/scaling study
         cfgs = {
             "small":  dict(d=64,  nhead=4, layers=2, ff=128, hid=128),
             "medium": dict(d=96,  nhead=4, layers=3, ff=192, hid=192),
             "large":  dict(d=128, nhead=8, layers=4, ff=256, hid=256),
             "xl":     dict(d=128, nhead=8, layers=5, ff=320, hid=320),
+            "100x":   dict(d=512, nhead=8, layers=4, ff=1024, hid=512),
         }
         cfg = cfgs.get(size, cfgs["small"])
         d = cfg["d"]; nhead = cfg["nhead"]; layers = cfg["layers"]; ff = cfg["ff"]; hid = cfg["hid"]

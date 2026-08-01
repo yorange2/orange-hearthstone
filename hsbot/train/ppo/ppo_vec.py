@@ -290,8 +290,10 @@ def main():
     ap.add_argument("--opponent-strategies", type=str, default="midrange",
                     help="comma-separated greedy opponent strategies (midrange,aggro,control,fatigue,ramp)")
     ap.add_argument("--size", type=str, default="small",
-                    choices=["small", "medium", "large", "xl"],
-                    help="model scale: small (173k), medium (532k), large (1.2M), xl (~1.7M)")
+                    choices=["small", "medium", "large", "xl", "100x"],
+                    help="model scale: small (173k), medium (532k), large (1.2M), xl (1.7M), "
+                         "100x (17.6M). small is the recommended default — see README "
+                         "'Model scale: bigger is not better here'")
     ap.add_argument("--fixed-deck", action="store_true")
     ap.add_argument("--eval-only", type=str, default=None,
                     help="evaluate a checkpoint and exit (no training)")

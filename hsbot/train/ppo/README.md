@@ -20,6 +20,12 @@ vs greedy  0.550   [95% CI 0.48–0.62]
 **The agent outperforms the one-ply greedy heuristic (~55%)** — the honest "do we beat a
 heuristic?" bar, not just "do we beat random?".
 
+> **Caveat on this number.** It was read off a `*best*` checkpoint selected as the max over
+> repeated 30-game evals, which biases high — reduced-budget replications dropped 8–18 points
+> when re-evaluated on a held-out seed over 200 games. See
+> [Model scale: bigger is not better here](#model-scale-bigger-is-not-better-here). The 55% has
+> not been re-measured at full budget on a held-out seed; treat it as optimistic until it is.
+
 **What got it there — imitation warm-start + PPO fine-tune.** PPO from scratch (even with the
 levers below) plateaus around ~40–47% vs greedy: a small model exploring from random weights
 rarely stumbles onto heuristic-level play. The breakthrough was a two-stage pipeline:
@@ -57,11 +63,23 @@ rarely stumbles onto heuristic-level play. The breakthrough was a two-stage pipe
   schedules, a greedy-prob curriculum, and best-checkpoint tracking. Also serves `--eval-only`.
 - **`device.py`**: `--device` resolution shared by both entry points. `auto` (the default) picks
   the first available of **cuda → mps → cpu**; an explicitly requested backend that isn't
-  available degrades to CPU with a warning. Note that a few transformer nested-tensor ops have
-  no MPS kernel and silently fall back to CPU, each fallback costing a device round-trip — which
-  is why MPS measures ~6× **slower** than CPU here (17 vs 105 steps/s on an M-series, `--size
-  small`). `auto` still honours the hardware; pass `--device cpu` on Apple silicon when
-  throughput matters.
+  available degrades to CPU with a warning.
+
+### Which device: it depends on the phase, not just the hardware
+
+Measured on an M-series (10-core), same model, so the only variable is where the tensors live:
+
+| phase | shapes | `small` | `100x` (17.6M) |
+| --- | --- | --- | --- |
+| PPO rollout (`collect_vec`) | tiny + **ragged**, change every step | CPU ~2× faster | CPU ~3× faster |
+| BC / PPO update | big fixed-ish batches (256–512) | MPS ~5× faster | MPS ~2.6× faster |
+
+MPS loses the rollout at **every** model size: the ragged token/action padding means the shape
+changes on nearly every call, which defeats MPS graph caching (a few nested-tensor ops also lack
+MPS kernels and fall back to CPU). It wins clearly on large-batch training, where one shape is
+reused. So the fastest recipe on Apple silicon is **`pretrain.py --device mps`, `ppo_vec.py
+--device cpu`** — about 2× faster end-to-end than using either device for both. `auto` cannot
+know this (it sees hardware, not phase), so pass `--device` explicitly when it matters.
 
 ### Self-play + greedy (opponent scheme)
 
@@ -158,6 +176,55 @@ because the greedy opponent's clone-heavy steps dominate wall time and the Pytho
 serial overhead; on a many-core + GPU box the batched inference pays off more and the gap
 widens. This throughput (plus the imitation warm-start) is what makes the ~55%-vs-greedy run
 finish in minutes on a laptop.
+
+## Model scale: bigger is not better here
+
+Controlled study across `--size`, **identical recipe and seed** for every arm (1500 BC games /
+8 epochs → 60 PPO iters × 4096 steps → 200-game eval vs greedy on a **held-out seed**), so the
+only variable is parameter count:
+
+| `--size` | params | BC top-1 | PPO wall-clock | vs greedy (200 games) |
+| --- | --- | --- | --- | --- |
+| `small` | 173k | **0.823** | **615 s** | **0.455** |
+| `xl` | 1.69M | 0.711 | 2508 s (4.1×) | 0.440 |
+| `100x` | 17.6M | 0.753 | 5693 s (9.3×) | 0.350 |
+
+Win rate **falls** monotonically as the model grows, at up to 9.3× the training cost. Two
+distinct causes, worth separating because only the first is fixable by tuning:
+
+1. **The big arms never optimized properly.** `100x`'s BC loss flatlines at ~1.2385 from epoch 2
+   onward (1.2390 → 1.2388 → 1.2385 → 1.2383 → 1.2387 …) — dead flat, accuracy stuck ~0.75,
+   while `small` reached 0.9122 and was still improving. `lr=1e-3` with no warmup collapses a
+   17.6M-param transformer into a degenerate solution; its PPO evals then swung 0.533 → 0.167 →
+   0.333. So this table is **not** evidence that capacity hurts — it is evidence that the
+   hyperparameters are tuned for `small` and do not transfer. Retry with LR warmup and a lower
+   LR before concluding anything about scale.
+2. **Capacity was never the bottleneck.** Data was held fixed while params grew 100× (86.6k BC
+   examples, 246k PPO transitions, one fixed Mage mirror). More fundamentally, the observation
+   itself caps achievable play — see below.
+
+**Note on `*best*` checkpoints.** Every arm dropped sharply from its reported `*best*` score to
+clean evaluation (`small` 0.567 → 0.455, `100x` 0.533 → 0.350). `*best*` takes the max over
+three 30-game evals (σ ≈ 0.09), so it selects noise. Re-evaluate on a held-out seed with more
+games before quoting a win rate — including the ~55% headline above, which was selected the
+same way.
+
+### Why ~50% vs greedy is close to this design's ceiling
+
+- **The agent sees strictly less than the heuristic it fights.** A token is 18 floats (type
+  one-hot, mine, cost, attack, health, 5 keyword flags, can-attack) — there is **no card
+  identity and no card text**. Two different 4-cost spells are the same input vector. Greedy
+  calls `MidRangeScore` through the real simulator with one-ply lookahead, so it implicitly
+  knows what every card does.
+- **Every training signal points at greedy.** BC initializes to ~82% action-match with greedy;
+  the shaping potential is `tanh(MidRangeScore.Rate()/200)` — *the greedy heuristic's own score
+  function* (`HearthstoneEnv.cs:147`); and the opponent is greedy 70% of the time. Shaping is
+  policy-invariant at convergence (Ng et al. 1999), but under a finite budget these three
+  anchors pull hard toward heuristic-level play.
+
+Highest-leverage fixes, in order: **add a card-identity embedding to the token** (removes the
+information ceiling), **decouple the shaping potential from `MidRangeScore`**, then raise the
+PPO sample budget. Model scale is the last lever, and only after LR warmup.
 
 ## Upgrade paths
 

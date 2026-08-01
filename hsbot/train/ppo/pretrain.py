@@ -109,7 +109,7 @@ def main():
     ap.add_argument("--batch-size", type=int, default=256)
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--size", type=str, default="small",
-                    choices=["small", "medium", "large", "xl"])
+                    choices=["small", "medium", "large", "xl", "100x"])
     ap.add_argument("--device", type=str, default="auto", choices=DEVICE_CHOICES,
                     help="compute device (auto = cuda > mps > cpu)")
     ap.add_argument("--out", type=str, default="pretrained.pt")
