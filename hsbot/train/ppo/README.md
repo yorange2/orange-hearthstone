@@ -1,7 +1,8 @@
 # ppo — reinforcement learning on SabberStone (prototype)
 
 A **PPO** agent that learns Hearthstone in SabberStone by **imitation warm-start + self-play/
-greedy PPO**, and **outperforms the one-ply greedy heuristic** (~55% over 200 games). RL path
+greedy PPO**, and **outperforms the one-ply greedy heuristic** (~58% over 1200 held-out games).
+RL path
 "A": a **masked action-scoring policy** over the variable legal-action set, built on a
 **transformer entity-encoder + transformer belief state**, driven through a simple stdio bridge
 to the C# engine.
@@ -10,21 +11,49 @@ to the C# engine.
 
 Evaluated against **two** fixed opponents: uniform-random (weak) and a **greedy heuristic**
 (SabberStone's own `MidRangeScore`, one-ply lookahead — the SabberStone analogue of
-Hearthstone-Script's `基础策略`). Over 200 eval games on the fixed Mage-mirror deck:
+Hearthstone-Script's `基础策略`) on the fixed Mage-mirror deck.
+
+This is the Phase 0 reference measurement, run under the post-determinism protocol: **argmax**
+policy, **held-out** eval seeds disjoint from training, **400 games per seed**, repeated over
+**three independent seeds** so the headline does not rest on one draw. Wilson 95% CIs.
+
+| checkpoint | seed 100000 | seed 200000 | seed 300000 | pooled (n=1200) |
+| --- | --- | --- | --- | --- |
+| `ppo_medium_best` (532k) | 0.578 | 0.560 | 0.630 | **0.589** [0.561–0.617] |
+| `ppo_tf_v2_best` (173k) | 0.580 | 0.565 | 0.618 | **0.588** [0.560–0.615] |
+| `ppo_tf_v3_best` (173k) | 0.588 | 0.562 | 0.585 | **0.578** [0.550–0.606] |
+| `ppo_multi_best` (173k) | 0.562 | — | — | — |
+| `ppo_tf_best` (173k) | 0.540 | — | — | (CI spans 0.5) |
+| `pretrained_tf` (BC only) | 0.417 | — | — | **loses to greedy** |
 
 ```
-vs random  1.000
-vs greedy  0.550   [95% CI 0.48–0.62]
+vs random  1.000   [0.963–1.000]   (n=100)
+vs greedy  0.578   [0.550–0.606]   (n=1200, 3 held-out seeds)
 ```
 
-**The agent outperforms the one-ply greedy heuristic (~55%)** — the honest "do we beat a
-heuristic?" bar, not just "do we beat random?".
+**The agent outperforms the one-ply greedy heuristic (~58%)** — the honest "do we beat a
+heuristic?" bar, not just "do we beat random?". Every PPO checkpoint clears 0.5 with the
+interval's *lower* bound above it, and the result replicates across all three seeds, so this is
+no longer a single-draw claim.
 
-> **Caveat on this number.** It was read off a `*best*` checkpoint selected as the max over
-> repeated 30-game evals, which biases high — reduced-budget replications dropped 8–18 points
-> when re-evaluated on a held-out seed over 200 games. See
-> [Model scale: bigger is not better here](#model-scale-bigger-is-not-better-here). The 55% has
-> not been re-measured at full budget on a held-out seed; treat it as optimistic until it is.
+> **This supersedes the earlier ~55% ± caveat.** That number came off a `*best*` checkpoint
+> selected as the max over repeated 30-game evals and was flagged as probably optimistic. Re-run
+> at full budget on held-out seeds it went **up**, not down (0.550 → 0.578–0.589). Two lessons,
+> and the second matters more than the first: the `*best*` selection bias was real but smaller
+> than feared *for these checkpoints*, and — because the reduced-budget replications that
+> produced the 8–18 point drops predate the determinism fixes — most of that apparent collapse
+> was measurement noise, not checkpoint quality. Pre-determinism numbers are not comparable to
+> post-determinism ones in either direction.
+
+> **Selection caveat that remains.** The table's top row is the max over six checkpoints on seed
+> 100000, so *that particular ranking* is selection-biased. The seed 200000/300000 columns were
+> run afterwards as independent confirmation and hold up, which is why the pooled column is
+> quoted rather than the best single cell. Ranking two checkpoints ~1 point apart is still not
+> resolved at n=1200 — see the sample-size arithmetic in Phase 0.
+
+**The warm start alone does not clear the bar.** `pretrained_tf` — behavioral cloning, no PPO —
+scores **0.417** vs greedy. So imitation gets close to the heuristic and PPO fine-tuning is what
+passes it; the two-stage pipeline is load-bearing, not just a speedup.
 
 **What got it there — imitation warm-start + PPO fine-tune.** PPO from scratch (even with the
 levers below) plateaus around ~40–47% vs greedy: a small model exploring from random weights
@@ -206,8 +235,16 @@ distinct causes, worth separating because only the first is fixable by tuning:
 **Note on `*best*` checkpoints.** Every arm dropped sharply from its reported `*best*` score to
 clean evaluation (`small` 0.567 → 0.455, `100x` 0.533 → 0.350). `*best*` takes the max over
 three 30-game evals (σ ≈ 0.09), so it selects noise. Re-evaluate on a held-out seed with more
-games before quoting a win rate — including the ~55% headline above, which was selected the
-same way.
+games before quoting a win rate.
+
+> **Update after the Phase 0 reference run.** This table's drops are **not** clean evidence of
+> selection bias, because both sides of each arrow predate the determinism fixes. When the
+> surviving `*best*` checkpoints were re-scored under the current protocol (argmax, held-out
+> seed, 1200 games) they landed at **0.578–0.589**, i.e. they did *not* collapse. Selection on
+> 30-game evals is still a real bias and still worth avoiding — but the 8–18 point drops
+> recorded here are better explained by a nondeterministic env and a sampling policy. Do not
+> cite this table as a measurement of selection bias; treat the whole table as pre-determinism
+> and not comparable to anything above.
 
 ### Why ~50% vs greedy is close to this design's ceiling
 
@@ -268,9 +305,13 @@ inside the noise, and `*best*` selection inflates results by 8–18 points (see 
   number
 - Evaluate with **argmax** by default (`--eval-sample` restores sampling), removing the largest
   remaining variance source
-- Re-measure `small` at full budget to establish one honest reference number *(still pending)*
+- Re-measure at full budget to establish one honest reference number ✅ *(done — see
+  [Result](#result--beats-the-greedy-heuristic))*
 
 **Gate:** a reference win rate with a confidence interval. Phases 1–4 are guesswork without it.
+**Passed:** `0.578 [0.550–0.606]` vs greedy over 1200 held-out games (3 seeds × 400), argmax.
+Repeated `--eval-only` runs at a fixed seed now agree exactly, and the three seeds agree within
+7 points. Anything Phases 1–5 claim must clear this interval to count.
 
 Note that fixing determinism **changes the numbers**: every win rate recorded before this point
 was measured under a nondeterministic env with a sampling policy, so the scaling table above is
@@ -309,6 +350,39 @@ feeding the ONNX value net is a separate contract and is untouched.
 
 **Gate:** BC top-1 must clear the current 0.823 *before* spending anything on PPO. If it does
 not, the embedding is miswired — a cheap early signal.
+
+**Gate result: not cleared.** Both arms trained with an identical recipe and seed (1500 BC games,
+8 epochs, `--fixed-deck`, `--seed 42`, `small`), the only difference being the embedding:
+
+| arm | BC train top-1 | held-out top-1 (500 samples) |
+| --- | --- | --- |
+| control (`--no-card-emb`) | **0.829** | 0.838 |
+| `--card-dim 16` | **0.823** | 0.838 |
+
+Held-out accuracy is *identical*; train accuracy is marginally lower. The gate says this means
+the embedding is miswired, so that was checked first — and it is **not**. The env emits varied
+dense indices over the reported vocab (`card_ids: [3966, 3966, 3720, 2622, 5481, 3632, 1342]`,
+`card_vocab: 8303`), reaching the model as a parallel array as designed.
+
+So the wiring is right and the **hypothesis is what failed**, which is the more interesting
+outcome. Three reasons it is unsurprising in hindsight, all of which the design notes above
+already contain the seeds of:
+
+1. **The target doesn't need card identity.** BC imitates greedy, and greedy ranks actions by
+   `MidRangeScore` over resulting board stats. Its choice is therefore mostly *predictable from
+   the stats already in the 18-float token* — the information the embedding adds is largely
+   information the teacher does not use. This gate was always a weak test of Phase 1: it asks
+   whether card identity helps copy a card-blind-ish teacher, not whether it helps *play*.
+2. **Almost none of the embedding trains.** Only 471 of 8303 rows ever appear, so ~7.5k of the
+   ~134k nominal params get a gradient — spread over 8 epochs of one fixed Mage mirror.
+3. **A fixed mirror is the worst case for it.** Both players draw from the same 30 cards, so
+   card identity is nearly constant across the matchup it was measured on.
+
+**Consequence for the plan.** Phase 1 was ranked first as "the hard information ceiling," and
+this does not refute that for *play* — but it does mean the cheap gate cannot confirm it, and
+the honest next test is the PPO arm, not another BC run. A stronger version of Phase 1 would
+vary decks (so identity carries signal) and stop using a stats-driven heuristic as the imitation
+target. Whether the embedding earns its place under PPO is measured in the A/B below.
 
 ### Phase 2 — Decouple the reward from greedy ✅ *(implemented)*
 
@@ -360,6 +434,32 @@ Only meaningful after Phases 0–1.
 defaulted to `midrange` alone). Training against the full set should reduce overfitting to one
 opponent. Note that eval is vs midrange, so this may not move the headline number even if the
 policy is genuinely better.
+
+### A/B: does the Phase 1–5 stack actually beat the baseline? *(running)*
+
+The gates above are cheap proxies; this is the measurement that decides. Two arms, **identical
+recipe and seed**, differing only in the new features:
+
+| | arm A (control) | arm B (Phase 1+2+4+5) |
+| --- | --- | --- |
+| card identity | `--no-card-emb` | `--card-dim 16` |
+| shaping potential | `midrange` (greedy's own objective) | `--potential board --shaping-end 0.0` |
+| LR schedule | cosine, no warmup | `--warmup-iters 5` |
+| opponent | `midrange` | `--opponent-strategies all` |
+| everything else | 60 iters × 4096 steps, 8 envs, `--seed 1`, `small`, `--fixed-deck` | identical |
+
+Protocol fixed **before** seeing results, to keep this from becoming another `*best*` story:
+score the **final** checkpoint (not `*best*`), 400 games × 3 held-out seeds (100000/200000/
+300000), argmax, and require the pooled interval to clear the Phase 0 reference of
+`0.578 [0.550–0.606]`.
+
+Read the result honestly when it lands: **four features move at once**, so a win says "the stack
+helps" and not which phase caused it, and a loss is likewise unattributable. Per the sample-size
+arithmetic in Phase 0, separating arms ~5 points apart needs ~1500 games each — so a difference
+inside ±3 points at n=1200 is **not resolved**, and should be reported as such rather than as a
+small win. Isolating individual phases needs one-factor-at-a-time runs after this.
+
+*Status: arm A PPO in progress; numbers land here when the run completes.*
 
 ### Not on the list
 
