@@ -465,7 +465,7 @@ inverts nicely:
 settles the capacity confound the scale study raised: this arm adds information while *reducing*
 trainable capacity relative to Phase 1, so a win cannot be attributed to size.
 
-**Encoder: TF-IDF + SVD, not a sentence transformer** (`--encoder st` switches, optional import).
+**Encoders: TF-IDF (default), sentence-transformer, or both concatenated.**
 Hearthstone rules text is templated rather than prose — `<b>Battlecry:</b> Deal $3 damage.` — so
 lexical overlap genuinely is the semantics, and the vocabulary (6679 tokens over 8303 cards) is
 small enough for SVD to recover the mechanic structure. It needs no model download, no network,
@@ -476,6 +476,47 @@ Fireball    -> Fireblast, Roaring Torch, Dynamite, Pyroblast     (direct damage)
 Flamestrike -> Felbloom, Arcane Explosion, Swipe, Boom!          (AoE damage)
 Polymorph   -> Bananas, Polymorph, Light-imbued                  (transform)
 ```
+
+#### Encoder comparison — they fail in opposite directions
+
+`card_text_compare.py` scores an encoder on the axes that matter for play rather than on eyeballed
+neighbour lists. Measured over all 8303 cards (`all-MiniLM-L6-v2` for the ST column):
+
+| axis (want) | TF-IDF 64d | MiniLM 384d | **both 448d** |
+| --- | --- | --- | --- |
+| textless vanilla cards, mean pairwise cos (low) | 0.492 | **0.194** | 0.268 |
+| textless pairs > 0.99 (low) | 5.7% | **0.1%** | **0.1%** |
+| `Shadow Word: Pain` ↔ `Death` (high) | 0.706 | **0.875** | 0.767 |
+| `Assassinate` ↔ `Execute` (high) | **0.861** | 0.826 | 0.818 |
+| unrelated floor, `Polymorph` ↔ `Fiery War Axe` (low) | −0.097 | −0.019 | **−0.190** |
+| global spread (near 0) | +0.011 | +0.197 | **+0.000** |
+
+Magnitude sensitivity, tested directly on synthetic strings so card names cannot confound it
+(lower = better separated, because these pairs *should* be distinguishable):
+
+```
+"deal 3 damage"   vs "deal 6 damage"     MiniLM 0.846   bag-of-words 0.667
+"deal 3 damage"   vs "deal 30 damage"    MiniLM 0.770   bag-of-words 0.667
+"summon a 2 2"    vs "summon a 7 7"      MiniLM 0.832   bag-of-words 0.429
+```
+
+**Neither encoder dominates.** Bag-of-words keeps numbers as distinct tokens — and magnitude is
+what decides lethal — but cannot tell 1417 textless vanilla cards apart. The sentence encoder
+separates those cleanly and reads past differing payload words, but blurs magnitude and is
+strongly anisotropic (+0.197: every vector shares one large common direction that carries no
+information). Note also that bag-of-words has no sense of *how* different two numbers are — 3-vs-6
+and 3-vs-30 both score exactly 0.667 — whereas MiniLM at least orders them.
+
+`--encoder both` concatenates them, centering and unit-normalizing each block first so neither
+dominates by scale. It keeps MiniLM's fix for the degenerate textless cluster (0.1% near-duplicate
+pairs), inherits the sharpest *unrelated* separation of the three (−0.190), and is the
+best-conditioned space measured (+0.000). It gives up a little on the axes where one encoder was
+individually strongest, which is the expected cost of averaging. Trainable cost is 181,330 vs
+175,186 params — the frozen block grows, the trained projection barely does.
+
+**TF-IDF stays the default** because it needs no download, no network and no extra dependency, and
+is bit-reproducible in CI; `sentence-transformers` is imported lazily and is not in
+`requirements.txt`.
 
 **Known weakness, measured.** 1417 cards have no rules text at all (vanilla minions like Chillwind
 Yeti), so their document is just a name. Those rows partially collapse — mean pairwise cosine

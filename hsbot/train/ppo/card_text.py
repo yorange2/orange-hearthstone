@@ -122,6 +122,20 @@ def sentence_transformer(docs: list[str], model: str) -> np.ndarray:
     return np.asarray(emb, dtype=np.float32)
 
 
+def _center_unit(emb: np.ndarray) -> np.ndarray:
+    """Center on the real rows, then L2-normalize each row.
+
+    Centering matters most for the sentence-transformer block. Measured on this corpus its raw
+    space is strongly anisotropic — mean pairwise cosine **+0.197**, against +0.011 for TF-IDF —
+    meaning every vector shares one large common direction that carries no information and would
+    otherwise consume most of the downstream projection's dynamic range. Row 0 is excluded from
+    the mean so the reserved padding row does not drag it.
+    """
+    m = emb[1:].mean(axis=0, keepdims=True)
+    out = emb - m
+    return out / np.maximum(np.linalg.norm(out, axis=1, keepdims=True), 1e-8)
+
+
 def ids_hash(ids: list[str]) -> str:
     return hashlib.sha256("\n".join(ids).encode()).hexdigest()[:16]
 
@@ -135,12 +149,34 @@ def build(cards: list[dict], dim: int, encoder: str, st_model: str) -> dict:
         emb = tfidf_svd(docs, dim)
     elif encoder == "st":
         emb = sentence_transformer(docs, st_model)
+    elif encoder == "both":
+        # The two encoders fail in complementary directions, measured on this corpus
+        # (card_text_compare.py):
+        #
+        #   axis                              TF-IDF    MiniLM
+        #   textless vanilla cards collapse   0.492     0.194     <- ST much better
+        #   frac of textless pairs >0.99      5.7%      0.1%      <- ST much better
+        #   "deal 3" vs "deal 6" damage       0.667     0.846     <- TF-IDF much better
+        #   "summon 2/2" vs "summon 7/7"      0.429     0.832     <- TF-IDF much better
+        #   global spread (want ~0)           +0.011    +0.197    <- TF-IDF much better
+        #
+        # Neither dominates: bag-of-words keeps numbers as distinct tokens (magnitude decides
+        # lethal) but cannot tell that 1417 textless vanilla cards differ; the sentence encoder
+        # separates those cleanly but blurs magnitude. Concatenating keeps both signals and lets
+        # the trained projection weight them, rather than picking a winner on intuition.
+        #
+        # Each block is centered and unit-normalized first so neither dominates by scale, then
+        # the pair is rescaled to unit norm — an equal 1/sqrt(2) share each.
+        a = _center_unit(tfidf_svd(docs, dim))
+        b = _center_unit(sentence_transformer(docs, st_model))
+        emb = np.hstack([a, b]).astype(np.float32) / np.sqrt(2.0)
     else:
         raise ValueError(f"unknown encoder {encoder!r}")
 
     emb[0] = 0.0  # padding_idx row must be zero, and stay zero
     return dict(emb=emb, ids=np.array(ids, dtype=object), vocab=len(ids),
-                ids_hash=ids_hash(ids), encoder=encoder)
+                ids_hash=ids_hash(ids), encoder=encoder,
+                st_model=st_model if encoder in ("st", "both") else "")
 
 
 def load(path: str, expect_vocab: int | None = None, expect_ids_hash: str | None = None):
@@ -200,7 +236,9 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="card_text_emb.npz")
     ap.add_argument("--dim", type=int, default=64, help="SVD components (tfidf encoder only)")
-    ap.add_argument("--encoder", default="tfidf", choices=("tfidf", "st"))
+    ap.add_argument("--encoder", default="tfidf", choices=("tfidf", "st", "both"),
+                    help="tfidf (default; no extra dependency, deterministic, CI-safe) | "
+                         "st (sentence-transformer) | both (concatenated, see build())")
     ap.add_argument("--st-model", default="all-MiniLM-L6-v2")
     ap.add_argument("--dll", default=None)
     ap.add_argument("--dotnet", default="dotnet")
