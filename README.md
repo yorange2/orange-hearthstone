@@ -45,7 +45,7 @@ cd ../hs-plugin && mvn test && mvn package
 
 Scaffold complete across all four stages; not yet run end-to-end (needs the toolchains + a Windows box for live play). See [`hsbot/README.md`](hsbot/README.md) for the checklist. CI (`.github/workflows/ci.yml`) runs the three parity suites + a training smoke test on push.
 
-The RL agent (`hsbot/train/ppo/`) **beats the one-ply greedy heuristic: 0.578 [95% CI 0.550–0.606] over 1200 held-out games** (3 seeds × 400, argmax, eval seeds disjoint from training). Behavioral cloning alone scores 0.417, so the PPO fine-tune is what passes the heuristic. Full protocol and the per-seed table are in [`hsbot/train/ppo/README.md`](hsbot/train/ppo/README.md#result--beats-the-greedy-heuristic); the plan for going further is in [the phase list](hsbot/train/ppo/README.md#plan-how-to-actually-get-past-50-vs-greedy).
+The RL agent (`hsbot/train/ppo/`) **narrowly beats the one-ply greedy heuristic: ~0.52–0.53 over 1200 held-out games per arm** (3 seeds × 400, argmax, eval seeds disjoint from training, final checkpoints). An earlier `0.578` came from `*best*`-selected checkpoints and is the recipe's best result rather than its typical one — three independently trained arms land 4.5–6 points lower, and doubling the PPO budget changes nothing. Behavioral cloning alone scores 0.417, so the PPO fine-tune is what passes the heuristic. Full protocol and the selection post-mortem are in [`hsbot/train/ppo/README.md`](hsbot/train/ppo/README.md#result--narrowly-beats-the-greedy-heuristic); the plan for going further is in [the phase list](hsbot/train/ppo/README.md#plan-how-to-actually-get-past-50-vs-greedy).
 
 ## Caveats
 

@@ -1,28 +1,76 @@
 # ppo — reinforcement learning on SabberStone (prototype)
 
 A **PPO** agent that learns Hearthstone in SabberStone by **imitation warm-start + self-play/
-greedy PPO**, and **outperforms the one-ply greedy heuristic** (~58% over 1200 held-out games).
-RL path
+greedy PPO**, and **edges past the one-ply greedy heuristic** — ~0.52–0.53 over 1200 held-out
+games per arm, reproducible from a fresh training run. RL path
 "A": a **masked action-scoring policy** over the variable legal-action set, built on a
 **transformer entity-encoder + transformer belief state**, driven through a simple stdio bridge
 to the C# engine.
 
-## Result — beats the greedy heuristic
+## Result — narrowly beats the greedy heuristic
 
 Evaluated against **two** fixed opponents: uniform-random (weak) and a **greedy heuristic**
 (SabberStone's own `MidRangeScore`, one-ply lookahead — the SabberStone analogue of
 Hearthstone-Script's `基础策略`) on the fixed Mage-mirror deck.
 
-This is the Phase 0 reference measurement, run under the post-determinism protocol: **argmax**
-policy, **held-out** eval seeds disjoint from training, **400 games per seed**, repeated over
-**three independent seeds** so the headline does not rest on one draw. Wilson 95% CIs.
+Protocol throughout: **argmax** policy, **held-out** eval seeds disjoint from training, **400
+games per seed**, **three independent seeds**, **final** checkpoints rather than `*best*`. Wilson
+95% CIs.
 
-> **These numbers are now historical.** Every checkpoint below is card-blind, and the card-blind
-> and learned-id model paths were removed in favour of card text (see
-> [Card identity is text-only](#card-identity-is-text-only)). This code can no longer load them,
-> so the table cannot be re-run at HEAD — reproduce it from a commit before the removal, or
-> retrain to establish a new reference. The measurement was sound when taken; it is simply no
-> longer reachable from this tree.
+### The reproducible number
+
+Three arms trained independently from scratch, each scored over 1200 held-out games on `fixed`
+decks:
+
+| arm | pooled | 95% CI | beats 0.5? |
+| --- | --- | --- | --- |
+| card-blind, 60 iters | **0.533** | [0.505–0.561] | **yes** |
+| card-text, 60 iters | 0.517 | [0.488–0.545] | not resolved |
+| card-text, 120 iters | 0.517 | [0.488–0.545] | not resolved |
+
+```
+vs random  1.000   [0.839–1.000]
+vs greedy  0.517–0.533 depending on arm
+```
+
+The agent **does** beat the heuristic, but narrowly, and only the card-blind arm clears 0.5 with
+its interval's lower bound. At n=1200 a rate this close to even is simply not resolved to better
+than ±3 points — see the sample-size arithmetic in Phase 0.
+
+### Why the headline used to say 0.578, and why it no longer does
+
+The earlier reference (0.578 [0.550–0.606], pooled over `ppo_tf_v3_best` and friends) was read off
+`*best*` checkpoints — the max over repeated 30-game evals during training. Re-scoring those same
+checkpoints on held-out seeds at n=1200 reproduced ~0.578, which was taken as evidence the
+selection bias had been overstated.
+
+**That inference was wrong, and three independently trained arms now show it.** Re-measuring an
+already-selected checkpoint cannot undo the selection: the maximum was taken before the new
+evaluation, so a held-out re-score confirms *that checkpoint's* strength, not that the training
+recipe typically reaches it. Only arms trained without selection expose the difference, and all
+three land 4.5–6 points lower with intervals excluding 0.578:
+
+```
+card-blind 60 iters vs 0.578:  -0.045  [-0.084, -0.005]
+card-text  60 iters vs 0.578:  -0.061  [-0.101, -0.022]
+card-text 120 iters vs 0.578:  -0.061  [-0.101, -0.022]
+```
+
+So **0.578 is the best checkpoint this recipe has produced, not what it typically produces.** The
+honest headline is ~0.52–0.53. The original caveat in this README — "treat it as optimistic until
+re-measured" — was right, and removing it on the strength of a held-out re-score was the mistake.
+
+### Budget is not the explanation
+
+The obvious rescue is that the fresh arms were under-trained. They were not: doubling PPO from 60
+to 120 iterations (245k → 491k transitions) moved the win rate by **+0.000 [-0.040, +0.040]** —
+identical to three decimals across 2400 games.
+
+> **The historical table below is no longer loadable.** Every checkpoint in it is card-blind, and
+> the card-blind and learned-id paths were removed in favour of card text (see
+> [Card identity is text-only](#card-identity-is-text-only)), so it cannot be re-run at HEAD.
+> Reproduce it from a commit before that removal if needed. It is kept because it is what the
+> `*best*`-selected number actually was.
 
 | checkpoint | seed 100000 | seed 200000 | seed 300000 | pooled (n=1200) |
 | --- | --- | --- | --- | --- |
@@ -38,19 +86,17 @@ vs random  1.000   [0.963–1.000]   (n=100)
 vs greedy  0.578   [0.550–0.606]   (n=1200, 3 held-out seeds)
 ```
 
-**The agent outperforms the one-ply greedy heuristic (~58%)** — the honest "do we beat a
-heuristic?" bar, not just "do we beat random?". Every PPO checkpoint clears 0.5 with the
-interval's *lower* bound above it, and the result replicates across all three seeds, so this is
-no longer a single-draw claim.
+**The agent outperforms the one-ply greedy heuristic** — the honest "do we beat a heuristic?"
+bar, not just "do we beat random?" — but by ~2–3 points, not the ~8 this section once claimed.
+Every checkpoint *in the table below* clears 0.5 with its interval's lower bound above it; those
+are `*best*`-selected, and freshly trained arms do not reliably match them.
 
-> **This supersedes the earlier ~55% ± caveat.** That number came off a `*best*` checkpoint
-> selected as the max over repeated 30-game evals and was flagged as probably optimistic. Re-run
-> at full budget on held-out seeds it went **up**, not down (0.550 → 0.578–0.589). Two lessons,
-> and the second matters more than the first: the `*best*` selection bias was real but smaller
-> than feared *for these checkpoints*, and — because the reduced-budget replications that
-> produced the 8–18 point drops predate the determinism fixes — most of that apparent collapse
-> was measurement noise, not checkpoint quality. Pre-determinism numbers are not comparable to
-> post-determinism ones in either direction.
+> ~~**This supersedes the earlier ~55% ± caveat.** ... the `*best*` selection bias was real but
+> smaller than feared *for these checkpoints*.~~ **Retracted.** Re-scoring a selected checkpoint
+> on held-out seeds does not measure selection bias, because the selection already happened — it
+> only confirms that one checkpoint is genuinely strong. Independently trained arms put the
+> recipe's typical result 4.5–6 points lower. The one part that still stands: pre-determinism
+> numbers are not comparable to post-determinism ones in either direction.
 
 > **Selection caveat that remains.** The table's top row is the max over six checkpoints on seed
 > 100000, so *that particular ranking* is selection-biased. The seed 200000/300000 columns were
@@ -68,7 +114,8 @@ rarely stumbles onto heuristic-level play. The breakthrough was a two-stage pipe
 
 1. **Imitation pre-training** (`pretrain.py`): behavioral cloning on greedy-vs-greedy games
    reaches ~85% top-1 action match — a policy that already ~39% matches greedy in-game.
-2. **PPO fine-tuning** (`ppo_vec.py --resume`) from that warm start climbs to ~55%.
+2. **PPO fine-tuning** (`ppo_vec.py --resume`) from that warm start climbs to ~0.52–0.53
+   typically, ~0.58 for the best checkpoint it has produced.
 
 **Supporting levers** (all on by default in `ppo_vec.py`): a **greedy-prob curriculum**
 (`--greedy-start/--greedy-end` ramp), **reward shaping** (`--shaping-coef`; potential-based
@@ -669,7 +716,13 @@ Only meaningful after Phases 0–1.
   exactly, so existing recipes are unchanged
 - Re-run the scale study with warmup, to answer the question the table above leaves open: does
   capacity help once optimization is not broken?
-- Raise the PPO sample budget (1.6M transitions at the full recipe)
+- ~~Raise the PPO sample budget (1.6M transitions at the full recipe)~~ ❌ **tested, no effect.**
+  Doubling PPO from 60 to 120 iterations (245k → 491k transitions) at fixed everything-else moved
+  the win rate by **+0.000 [-0.040, +0.040]** over 2400 held-out games — identical to three
+  decimals. This was the leading candidate for the gap between freshly trained arms (~0.52) and
+  the `*best*` reference (0.578), and it is now ruled out; the gap is selection, not budget. A
+  further 4× is not obviously worth buying on this evidence, though 2× is a weak test of a lever
+  that might need 10×.
 - Free speedup already measured: BC on `mps`, PPO on `cpu` ≈ 2× end-to-end
 
 ### Phase 5 — Opponent diversity ✅ *(implemented)*
