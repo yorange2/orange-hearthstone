@@ -7,7 +7,7 @@ Phase 3 — save: the pre-trained model is a strong starting point for PPO fine-
     python pretrain.py --games 2000 --out pretrained.pt
 """
 from __future__ import annotations
-import argparse, time
+import argparse, os, time
 
 from device import resolve_device, CHOICES as DEVICE_CHOICES  # before torch: sets MPS fallback
 
@@ -45,10 +45,38 @@ def generate_data(env, num_games: int) -> list[dict]:
     return data
 
 
-def pretrain(policy, data, epochs, batch_size, lr, device):
-    """Behavioral cloning: cross-entropy loss on predicting greedy's action."""
+def load_cache(path, key):
+    """Return (data, vocab, ids_hash) from `path`, or None if absent or generated differently.
+
+    The key is the generation protocol (games/seed/deck); a mismatch regenerates rather than
+    silently training on data from another arm's protocol."""
+    if not path or not os.path.exists(path):
+        return None
+    blob = torch.load(path, weights_only=False)
+    if blob["key"] != key:
+        print(f"cache {path} was generated with {blob['key']}, need {key} — regenerating",
+              flush=True)
+        return None
+    return blob["data"], blob["vocab"], blob["ids_hash"]
+
+
+def save_cache(path, key, data, vocab, ids_hash):
+    if not path:
+        return
+    torch.save(dict(key=key, data=data, vocab=vocab, ids_hash=ids_hash), path)
+    print(f"cached {len(data)} examples -> {path}", flush=True)
+
+
+def pretrain(policy, data, epochs, batch_size, lr, device, warmup_steps=0):
+    """Behavioral cloning: cross-entropy loss on predicting greedy's action.
+
+    `warmup_steps` linearly ramps the LR from 0 over the first N optimizer steps. Off by
+    default (the `small` recipe never needed it); required for the larger presets, whose
+    loss otherwise flatlines from epoch 2 at lr=1e-3 — see README "Model scale"."""
     policy.train()
     opt = torch.optim.Adam(policy.parameters(), lr=lr)
+    sched = (torch.optim.lr_scheduler.LambdaLR(opt, lambda s: min(1.0, (s + 1) / warmup_steps))
+             if warmup_steps > 0 else None)
     n = len(data)
     losses = []
 
@@ -75,12 +103,16 @@ def pretrain(policy, data, epochs, batch_size, lr, device):
             opt.zero_grad()
             loss.backward()
             opt.step()
+            if sched is not None:
+                sched.step()
             epoch_losses.append(loss.item())
 
         avg = float(np.mean(epoch_losses))
         losses.append(avg)
         acc = evaluate_imitation(policy, data[:min(1000, n)], device)
-        print(f"  epoch {ep + 1:3d}/{epochs}  loss {avg:.4f}  top-1 acc {acc:.3f}", flush=True)
+        cur_lr = opt.param_groups[0]["lr"]
+        print(f"  epoch {ep + 1:3d}/{epochs}  loss {avg:.4f}  top-1 acc {acc:.3f}  lr {cur_lr:.2e}",
+              flush=True)
 
     return losses
 
@@ -112,6 +144,12 @@ def main():
     ap.add_argument("--epochs", type=int, default=20)
     ap.add_argument("--batch-size", type=int, default=256)
     ap.add_argument("--lr", type=float, default=1e-3)
+    ap.add_argument("--warmup-steps", type=int, default=0,
+                    help="linear LR warmup over the first N optimizer steps. Recommended for "
+                         "large/xl/100x, whose BC loss flatlines at lr=1e-3 without it")
+    ap.add_argument("--cache", type=str, default=None,
+                    help="path to cache the generated (state, greedy-action) pairs. Reused only "
+                         "if games/seed/deck match, so two arms can share identical BC data")
     ap.add_argument("--size", type=str, default="small",
                     choices=["small", "medium", "large", "xl", "100x"])
     ap.add_argument("--device", type=str, default="auto", choices=DEVICE_CHOICES,
@@ -137,16 +175,23 @@ def main():
     # rollout warning would tell the reader the opposite of the right thing here.
     device = resolve_device(args.device, phase="batch")  # up front so a bad device fails before phase 1
 
-    # Phase 1: generate data
-    print(f"Phase 1: generating data ({args.games} greedy-vs-greedy games)...", flush=True)
-    t0 = time.time()
-    env = SabberEnv(seed=args.seed, deck=deck_mode(args), dll=args.dll, dotnet=args.dotnet)
-    env_vocab = env.card_vocab()
-    env_ids_hash = env.card_ids_hash()
-    data = generate_data(env, args.games)
-    env.close()
-    dt = time.time() - t0
-    print(f"Generated {len(data)} training examples in {dt:.1f}s", flush=True)
+    # Phase 1: generate data (or reuse a cache generated under the same protocol)
+    key = dict(games=args.games, seed=args.seed, deck=deck_mode(args))
+    cached = load_cache(args.cache, key)
+    if cached is not None:
+        data, env_vocab, env_ids_hash = cached
+        print(f"Phase 1: reusing {len(data)} cached examples from {args.cache}", flush=True)
+    else:
+        print(f"Phase 1: generating data ({args.games} greedy-vs-greedy games)...", flush=True)
+        t0 = time.time()
+        env = SabberEnv(seed=args.seed, deck=deck_mode(args), dll=args.dll, dotnet=args.dotnet)
+        env_vocab = env.card_vocab()
+        env_ids_hash = env.card_ids_hash()
+        data = generate_data(env, args.games)
+        env.close()
+        dt = time.time() - t0
+        print(f"Generated {len(data)} training examples in {dt:.1f}s", flush=True)
+        save_cache(args.cache, key, data, env_vocab, env_ids_hash)
 
     # Phase 2: pre-train
     print(f"\nPhase 2: behavioral cloning ({args.epochs} epochs, device={device})...", flush=True)
@@ -156,7 +201,8 @@ def main():
     trainable = sum(p.numel() for p in policy.parameters() if p.requires_grad)
     print(f"Model: {args.size} ({params:,} params, {trainable:,} trainable)", flush=True)
     print(card_text_mod.describe(card_vocab, card_text, args.card_dim), flush=True)
-    pretrain(policy, data, args.epochs, args.batch_size, args.lr, device=device)
+    pretrain(policy, data, args.epochs, args.batch_size, args.lr, device=device,
+             warmup_steps=args.warmup_steps)
 
     # Phase 3: save
     torch.save(policy.state_dict(), args.out)
