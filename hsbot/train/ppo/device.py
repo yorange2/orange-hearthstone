@@ -2,26 +2,40 @@
 
 PYTORCH_ENABLE_MPS_FALLBACK is set ahead of `import torch` because the variable is documented
 as read when PyTorch registers the fallback kernel — the placement that works under every
-version, at no cost. It is a safety net, not something this model currently relies on.
+version, at no cost. It is load-bearing on MPS, not a safety net: without it, any masked
+transformer call in eval mode raises outright.
 
-Note on what MPS does *not* do here. An earlier version of this file claimed the transformer's
-nested-tensor ops lack MPS kernels and fall back to CPU, paying a round-trip per call. That is
-wrong, and the correction matters because it was the stated reason for a performance number.
-`torch.nn.TransformerEncoder` gates its nested-tensor fast path on
-`src.device.type in ("cpu", "cuda", privateuse1)` (torch 2.8,
+    NotImplementedError: The operator 'aten::_nested_tensor_from_mask_left_aligned'
+    is not currently implemented for the MPS device.
+
+What MPS does and does not do here. `torch.nn.TransformerEncoder` gates its nested-tensor fast
+path on `src.device.type in ("cpu", "cuda", privateuse1)` (torch 2.8,
 `torch/nn/modules/transformer.py:496`); MPS is not in that list, so `convert_to_nested` stays
-False and `torch._nested_tensor_from_mask` is never reached. Verified by counting calls:
+False and `torch._nested_tensor_from_mask` is never reached. But that device gate is checked
+*after* `torch._nested_tensor_from_mask_left_aligned`, which therefore still runs on MPS — and
+has no MPS kernel. Verified by counting calls:
 
     cpu  eval   _nested_tensor_from_mask=1   left_aligned_check=1
     mps  eval   _nested_tensor_from_mask=0   left_aligned_check=1
     cpu  train  _nested_tensor_from_mask=0   left_aligned_check=0
     mps  train  _nested_tensor_from_mask=0   left_aligned_check=0
 
-Two consequences. There is no silent nested-tensor fallback to avoid on MPS, so any patch that
-"works around" one is a no-op. And the fast path is disabled in *training* mode on every device
-(`first_layer.training` is checked before the device gate), so mask handling cannot explain a
-train-time device difference at all — whatever makes MPS slower here lies elsewhere, most
-plausibly per-call dispatch overhead on small, constantly-reshaped tensors.
+So on MPS the *conversion* never happens but the *check* does, and the check round-trips to the
+CPU on every masked forward call. An earlier revision of this file read the same table as
+showing there was no fallback to avoid; the `left_aligned_check=1` row is exactly the fallback.
+
+Two consequences, and both are now acted on rather than just noted. Eval-mode calls should not
+pass a mask that masks nothing: `EntityEncoder`/`TemporalEncoder`/`ActorCritic` accept None for
+a mask whose entries are all True, and `act`/`batched_act` pass None when they can establish
+that CPU-side (free — the tensors have not been transferred yet). Measured on B=1 rollout,
+dropping both masks: small 2.0x, large 1.8x, 100x 2.7x on MPS. Dropping only one gives ~1.15x,
+because whichever mask remains still pays the round-trip.
+
+The fast path is disabled in *training* mode on every device (`first_layer.training` is checked
+before the device gate), so none of this applies to the batched update, and mask handling cannot
+explain a train-time device difference at all. What remains there is per-call dispatch overhead
+on small tensors: MPS rollout throughput tracks layer *count*, not width — it is nearly flat
+from 1.9M to 10M params at 4 layers, while CPU throughput falls with FLOPs.
 """
 from __future__ import annotations
 import os
@@ -32,20 +46,28 @@ import torch  # noqa: E402  (kept below the setdefault above; see module docstri
 
 CHOICES = ["auto", "cpu", "cuda", "mps"]
 
-# Which device wins depends on the PHASE, so the advice has to as well. Re-measured on an
-# M-series (10-core), `small`, back to back, with the totals below including a device-independent
-# data-generation step and process startup — which understates the MPS win on `batch`:
+# Which device wins depends on the PHASE, so the advice has to as well. Measured on an M-series
+# (10-core), end to end with SabberStone in the loop, 8 envs, median of 3:
 #
-#   phase     workload                              CPU          MPS         winner
-#   batch     BC, 3 epochs (blind / text)           23.1 / 22.9s 12.2 / 11.6s MPS ~2.5x
-#   rollout   PPO 5 iters x 2048 steps              990 steps/s  104 steps/s  CPU  ~9.5x
+#   phase     size     CPU          MPS          winner
+#   rollout   small    1297 steps/s  157 steps/s  CPU  8.3x
+#   rollout   large     594 steps/s  165 steps/s  CPU  3.6x
+#   rollout   100x      236 steps/s  158 steps/s  CPU  1.5x
+#   batch     small    2294 samp/s  13778 samp/s  MPS  6.0x
+#   batch     large     606 samp/s   3258 samp/s  MPS  5.4x
+#   batch     100x      186 samp/s    591 samp/s  MPS  3.2x
 #
-# The earlier single unconditional warning was wrong for BC — it fired on the one phase where
-# MPS is the right choice. It also attributed the rollout gap to a nested-tensor fallback that
-# does not happen (see the module docstring); the gap is real, the mechanism was not.
-MPS_ROLLOUT_WARNING = ("note: MPS measured ~9x slower than CPU on this model's rollout "
-                       "(ragged shapes defeat graph caching); pass --device cpu")
-MPS_BATCH_NOTE = "note: MPS measured ~2.5x faster than CPU for this phase's batched updates"
+# So CPU still wins every rollout, but the margin collapses with model size (8.3x -> 1.5x) while
+# MPS wins every batched update. The rollout gap is NOT about ragged shapes defeating a graph
+# cache, which is what an earlier revision of this file claimed. It is per-call overhead: MPS
+# rollout throughput tracks the number of kernel launches, so it barely moves between `small` and
+# `100x` (157 -> 158 steps/s) while CPU falls with FLOPs. Scaling the model does not make MPS
+# faster; it makes CPU slower. Extrapolating the trend, MPS would take the rollout somewhere past
+# `100x` — but batch size is the stronger lever: at a fixed batch of 32, MPS already wins 2.0-4.5x
+# at every size, and the real rollout only averages a batch of ~5.
+MPS_ROLLOUT_WARNING = ("note: MPS measured slower than CPU on this model's rollout "
+                       "(1.5x at 100x, 8x at small — per-call overhead); prefer --device cpu")
+MPS_BATCH_NOTE = "note: MPS measured 3-6x faster than CPU for this phase's batched updates"
 
 
 def _available(name: str) -> bool:
@@ -80,3 +102,27 @@ def resolve_device(spec: str, phase: str = "rollout") -> str:
     if device == "mps":
         print(MPS_BATCH_NOTE if phase == "batch" else MPS_ROLLOUT_WARNING, flush=True)
     return device
+
+
+def tune_for_device(model, device):
+    """Apply device-specific settings that cannot be chosen until the model has a device.
+
+    Call once, after `.to(device)`. Returns the model, so it chains.
+
+    Currently one setting: on MPS, turn off `TransformerEncoder`'s nested-tensor fast path. That
+    path can never actually engage on MPS — it is gated on
+    `src.device.type in ("cpu", "cuda", privateuse1)` — but the eligibility *check* in front of
+    it (`torch._nested_tensor_from_mask_left_aligned`) runs first and has no MPS kernel, so every
+    masked eval call round-trips to the CPU to answer a question whose answer is discarded.
+    `use_nested_tensor=False` is tested earlier in the same elif chain (torch 2.8,
+    `torch/nn/modules/transformer.py:453` vs `:466`), so clearing it skips the check outright.
+
+    Measured end-to-end on rollout: MPS 1.3-1.4x faster with it off. It is deliberately NOT
+    applied on CPU, where the fast path is reachable and does pay for itself — forcing it off
+    there measured 0.80-0.98x, i.e. a loss.
+    """
+    if device == "mps":
+        for m in model.modules():
+            if isinstance(m, torch.nn.TransformerEncoder):
+                m.use_nested_tensor = False
+    return model

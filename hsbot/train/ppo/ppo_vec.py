@@ -18,7 +18,7 @@ import math
 import random
 import time
 
-from device import resolve_device, CHOICES as DEVICE_CHOICES  # before torch: sets MPS fallback
+from device import resolve_device, tune_for_device, CHOICES as DEVICE_CHOICES  # before torch: sets MPS fallback
 
 import numpy as np
 import torch
@@ -39,13 +39,24 @@ def batched_act(policy, obs_list, hc_list, device="cpu"):
     priv = torch.from_numpy(np.asarray([o.priv for o in obs_list], np.float32))
     hin = torch.cat([hc[0] for hc in hc_list], 0)
     cin = torch.cat([hc[1] for hc in hc_list], 0)
-    logits, v, h, c = policy(tok.to(device), tmask.to(device), hin.to(device), cin.to(device),
+    # Drop masks that mask nothing: every obs having the same token count (so `pad` added no
+    # padding), and every belief window already full. Both hold often enough to matter and are
+    # tested here, on the CPU tensors, so the test does not force a device sync (see `act`).
+    tm = None if bool(tmask.all()) else tmask.to(device)
+    cm = None if bool(cin.all()) else cin.to(device)
+    logits, v, h, c = policy(tok.to(device), tm, hin.to(device), cm,
                               priv.to(device), act_t.to(device), amask.to(device), cid.to(device))
     dist = torch.distributions.Categorical(logits=logits)
     idx = dist.sample()
     lp = dist.log_prob(idx)
-    new_hc = [(h[i:i + 1].cpu(), c[i:i + 1].cpu()) for i in range(len(obs_list))]
-    return idx.tolist(), lp.tolist(), v.tolist(), new_hc
+    # Bring everything back in ONE transfer, then slice on the host. The obvious per-env version
+    # (`h[i:i+1].cpu()` inside the loop) issues 2*B device->host copies, and on MPS each one is a
+    # sync point — so its cost grows with the batch and cancels out the benefit of batching at
+    # all. Stacking the three head outputs costs one more copy instead of three.
+    h_c, c_c = h.cpu(), c.cpu()
+    out = torch.stack([idx.float(), lp, v]).cpu()
+    new_hc = [(h_c[i:i + 1], c_c[i:i + 1]) for i in range(len(obs_list))]
+    return out[0].long().tolist(), out[1].tolist(), out[2].tolist(), new_hc
 
 
 def _blank_traj():
@@ -83,8 +94,17 @@ def collect_vec(vec, main, greedy_prob, steps, gamma, shaping_coef, strategies, 
 
         cmds: list[str | None] = [None] * N
 
+        # One inference call per tick, not two. The main seat and the self-play opponent seat run
+        # the *same* network, so batching them together is free and lifts the batch `batched_act`
+        # sees from ~3 to ~5 at the default 8 envs. That matters because rollout throughput is set
+        # by per-call overhead, not tensor size — most of all on MPS. The two seats still consume
+        # their results separately below: only the main seat records transitions.
+        act_ids = main_ids + self_ids
+        if act_ids:
+            states = [mh[i] for i in main_ids] + [oh[i] for i in self_ids]
+            idxs, lps, vs, nhc = batched_act(main, [cur[i] for i in act_ids], states, device)
+
         if main_ids:
-            idxs, lps, vs, nhc = batched_act(main, [cur[i] for i in main_ids], [mh[i] for i in main_ids], device)
             for k, i in enumerate(main_ids):
                 t = T[i]
                 t["tok"].append(cur[i].tokens); t["cid"].append(cur[i].card_ids)
@@ -99,9 +119,8 @@ def collect_vec(vec, main, greedy_prob, steps, gamma, shaping_coef, strategies, 
                 total += 1
 
         if self_ids:
-            idxs, _, _, nhc = batched_act(main, [cur[i] for i in self_ids], [oh[i] for i in self_ids], device)
-            for k, i in enumerate(self_ids):
-                oh[i] = nhc[k]
+            for k, i in enumerate(self_ids, start=len(main_ids)):   # self seats sit after the
+                oh[i] = nhc[k]                                      # main seats in the merged call
                 cmds[i] = f"step {idxs[k]}"
 
         for i in greedy_ids:
@@ -205,7 +224,8 @@ def train(args):
     # actually emits, and a checkpoint is only loadable into a model built with the same vocab.
     card_vocab, card_text = card_text_mod.resolve(args.card_text, eval_env.card_vocab(),
                                                   eval_env.card_ids_hash())
-    main = ActorCritic(size=args.size, card_dim=args.card_dim, card_text=card_text).to(device)
+    main = tune_for_device(
+        ActorCritic(size=args.size, card_dim=args.card_dim, card_text=card_text).to(device), device)
     total = sum(p.numel() for p in main.parameters())
     trainable = sum(p.numel() for p in main.parameters() if p.requires_grad)
     print(card_text_mod.describe(card_vocab, card_text, args.card_dim), flush=True)
