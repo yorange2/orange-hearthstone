@@ -9,7 +9,7 @@ Phase 3 — save: the pre-trained model is a strong starting point for PPO fine-
 from __future__ import annotations
 import argparse, os, time
 
-from device import resolve_device, CHOICES as DEVICE_CHOICES  # before torch: sets MPS fallback
+from device import resolve_device, tune_for_device, CHOICES as DEVICE_CHOICES  # before torch: sets MPS fallback
 
 import numpy as np
 import torch
@@ -196,7 +196,8 @@ def main():
     # Phase 2: pre-train
     print(f"\nPhase 2: behavioral cloning ({args.epochs} epochs, device={device})...", flush=True)
     card_vocab, card_text = card_text_mod.resolve(args.card_text, env_vocab, env_ids_hash)
-    policy = ActorCritic(size=args.size, card_dim=args.card_dim, card_text=card_text).to(device)
+    policy = tune_for_device(
+        ActorCritic(size=args.size, card_dim=args.card_dim, card_text=card_text).to(device), device)
     params = sum(p.numel() for p in policy.parameters())
     trainable = sum(p.numel() for p in policy.parameters() if p.requires_grad)
     print(f"Model: {args.size} ({params:,} params, {trainable:,} trainable)", flush=True)

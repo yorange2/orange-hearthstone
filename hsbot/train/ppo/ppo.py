@@ -52,11 +52,19 @@ class EntityEncoder(nn.Module):
         self.out_dim = d
 
     def forward(self, tokens, tmask, card_ids=None):
-        """tokens [B,T,token_dim]; tmask [B,T] bool (True = real); card_ids [B,T] int64. -> [B,d]."""
+        """tokens [B,T,token_dim]; tmask [B,T] bool (True = real); card_ids [B,T] int64. -> [B,d].
+
+        `tmask=None` means "every token is real" and takes a mask-free path that is numerically
+        identical (an all-True mask masks nothing, and the masked mean-pool reduces to a plain
+        mean). It exists for speed: see the note on `src_key_padding_mask` in device.py — passing
+        any mask in eval mode reaches an op with no MPS kernel, so each call round-trips to the
+        CPU. Callers that know their mask is all-True should pass None instead."""
         if card_ids is None:
             card_ids = torch.zeros(tokens.shape[:2], dtype=torch.long, device=tokens.device)
         tokens = torch.cat([tokens, self.card_proj(self.card_text(card_ids))], dim=-1)
         x = self.embed(tokens)
+        if tmask is None:
+            return self.tr(x).mean(1)                          # no padding -> plain mean pool
         x = self.tr(x, src_key_padding_mask=~tmask)          # ignore padded tokens
         m = tmask.float().unsqueeze(-1)                       # [B,T,1]
         return (x * m).sum(1) / m.sum(1).clamp_min(1.0)       # masked mean pool
@@ -81,8 +89,11 @@ class TemporalEncoder(nn.Module):
         self.tr = nn.TransformerEncoder(layer, num_layers=layers)
 
     def forward(self, hist, mask):
-        """hist [B,K,d] (newest at slot -1); mask [B,K] bool (True = real). -> belief [B,d]."""
-        x = self.tr(hist + self.pos, src_key_padding_mask=~mask)
+        """hist [B,K,d] (newest at slot -1); mask [B,K] bool (True = real). -> belief [B,d].
+
+        `mask=None` means "the window is full" (no early-game padding left) and skips the mask
+        for the same reason as `EntityEncoder.forward` — same result, fewer CPU round-trips."""
+        x = self.tr(hist + self.pos, src_key_padding_mask=None if mask is None else ~mask)
         return x[:, -1, :]                                    # the current decision's slot = belief
 
 
@@ -140,12 +151,20 @@ class ActorCritic(nn.Module):
         return hist, mask
 
     def forward(self, tokens, tmask, hist_in, mask_in, priv, actions, amask, card_ids=None):
+        """`tmask` and `mask_in` may each be None, meaning "every slot is real" — see
+        `EntityEncoder.forward`. `mask_in=None` says the belief window is already full, and since
+        this step appends another real slot the window stays full, so the temporal mask is
+        skipped too. The returned mask is always a tensor regardless, so callers can keep
+        carrying it between steps unchanged."""
         e = self.enc(tokens, tmask, card_ids)                # [B,d] current per-state embedding
         # shift the window left (drop oldest) and append the current embedding at slot -1
         hist = torch.cat([hist_in[:, 1:, :], e.unsqueeze(1)], dim=1)          # [B,MEM,d]
         ones = torch.ones(e.shape[0], 1, dtype=torch.bool, device=e.device)
-        mask = torch.cat([mask_in[:, 1:], ones], dim=1)                       # [B,MEM]
-        h = self.temporal(hist, mask)                        # [B,d] belief state
+        if mask_in is None:
+            mask = ones.expand(-1, self.mem).contiguous()                     # [B,MEM] all real
+        else:
+            mask = torch.cat([mask_in[:, 1:], ones], dim=1)                   # [B,MEM]
+        h = self.temporal(hist, None if mask_in is None else mask)  # [B,d] belief state
         _, n, _ = actions.shape
         se = h.unsqueeze(1).expand(-1, n, -1)                # [B,N,d]
         logits = self.scorer(torch.cat([se, actions], dim=-1)).squeeze(-1)  # [B,N]
@@ -164,12 +183,15 @@ def act(policy, obs, hist_in, mask_in, argmax=False):
     variance that swamps the effect being measured."""
     dev = next(policy.parameters()).device
     tk = torch.from_numpy(obs.tokens).unsqueeze(0).to(dev)
-    tm = torch.ones(1, obs.tokens.shape[0], dtype=torch.bool, device=dev)
     ci = torch.from_numpy(obs.card_ids).unsqueeze(0).to(dev)
     p = torch.from_numpy(obs.priv).unsqueeze(0).to(dev)
     a = torch.from_numpy(obs.actions).unsqueeze(0).to(dev)
     am = torch.ones(1, obs.actions.shape[0], dtype=torch.bool, device=dev)
-    logits, v, hist, mask = policy(tk, tm, hist_in.to(dev), mask_in.to(dev), p, a, am, ci)
+    # A single obs is never padded, so the entity mask is unconditionally all-True -> pass None.
+    # The belief window *is* padded for the first MEM decisions of a game; test that on the CPU
+    # copy, before the transfer, so the test itself costs no device sync.
+    win = None if bool(mask_in.all()) else mask_in.to(dev)
+    logits, v, hist, mask = policy(tk, None, hist_in.to(dev), win, p, a, am, ci)
     dist = torch.distributions.Categorical(logits=logits[0])
     idx = logits[0].argmax() if argmax else dist.sample()
     return int(idx), float(dist.log_prob(idx)), float(v[0]), hist.cpu(), mask.cpu()
