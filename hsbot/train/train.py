@@ -17,7 +17,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 
-from model import ValueNet, FEATURE_DIM
+from model import ValueNet, FEATURE_DIM, NORMS
 
 DEFAULT_OUT = os.path.expanduser("~/.hs-script/models/value_net.v1.onnx")
 
@@ -69,6 +69,11 @@ def main() -> None:
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--val-split", type=float, default=0.1)
     ap.add_argument("--smoke", type=int, default=0, help="train on N synthetic rows instead of --data")
+    ap.add_argument("--norm", choices=list(NORMS), default="none",
+                    help="normalization between each Linear and its ReLU (see ValueNet)")
+    ap.add_argument("--dropout", type=float, default=None,
+                    help="default 0.1, or 0.0 with --norm batch (dropout and BatchNorm disagree "
+                         "about train/test variance)")
     ap.add_argument("--device", choices=["auto", "cpu", "cuda", "mps"], default="auto",
                     help="compute device; 'auto' picks cuda > mps > cpu")
     args = ap.parse_args()
@@ -93,7 +98,11 @@ def main() -> None:
     xv, yv = torch.from_numpy(x[vi]).to(device), torch.from_numpy(y[vi]).to(device)
 
     loader = DataLoader(TensorDataset(xt, yt), batch_size=args.batch, shuffle=True)
-    model = ValueNet().to(device)
+    # BatchNorm's running statistics are estimated under dropout's train-time variance but used
+    # at eval without it; shipping that combination as the one-flag default would be a trap.
+    dropout = args.dropout if args.dropout is not None else (0.0 if args.norm == "batch" else 0.1)
+    model = ValueNet(dropout=dropout, norm=args.norm).to(device)
+    print(f"model: norm={args.norm} dropout={dropout}")
     opt = torch.optim.Adam(model.parameters(), lr=args.lr)
     loss_fn = torch.nn.BCEWithLogitsLoss()
 

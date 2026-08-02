@@ -20,8 +20,12 @@ jobs:
         run: |
           python hsbot/train/reference_features.py
           git diff --exit-code hsbot/fixtures
+      - name: value-net normalization + ONNX export tests
+        run: cd hsbot/train && python test_value_net.py
       - name: train smoke + ONNX export/verify
         run: python hsbot/train/train.py --smoke 8000 --epochs 5 --out /tmp/value_net.v1.onnx
+      - name: train smoke with batchnorm
+        run: python hsbot/train/train.py --smoke 4000 --epochs 3 --norm batch --out /tmp/value_net.bn.onnx
 
   # C#: feature-parity xUnit test against the shared fixtures. Needs the SabberStone clone.
   dotnet:
